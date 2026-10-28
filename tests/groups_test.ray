@@ -1,0 +1,67 @@
+// The group coordinator on its own: dealing partitions, rebalances on join/leave/expiry, commits
+// refused from a stale generation or a member that does not own the partition, and offsets that
+// survive a restart.
+
+import std/fs;
+import std/time;
+import groups;
+
+fn parts(j: groups.Joined) -> [string] {
+    j.owned.map(fn(o: groups.Owned) -> string { "${o.topic}/${o.partition}" })
+}
+
+@test
+fn membership_and_commits() {
+    let dir = fs.make_temp_dir("raybus-g").unwrap();
+    let c = groups.start(dir, 300).unwrap();
+    let counts = [("orders", 4)];
+    let a1 = groups.join_group(c, "billing", "a", ["orders"], counts).unwrap();
+    assert_eq((a1.generation, parts(a1)), (1, ["orders/0", "orders/1", "orders/2", "orders/3"]));
+    // A second member: a new generation, half each.
+    let b1 = groups.join_group(c, "billing", "b", ["orders"], counts).unwrap();
+    assert_eq((b1.generation, parts(b1)), (2, ["orders/1", "orders/3"]));
+    assert_eq(groups.heartbeat_of(c, "billing", "a", 1), Result.Ok("rebalance"));
+    // a's commit from generation 1 is refused; after rejoining, only its own partitions.
+    assert(groups.commit_offsets(c, "billing", "a", 1, [("orders", 0, 10)]).is_err());
+    let a2 = groups.join_group(c, "billing", "a", ["orders"], counts).unwrap();
+    assert_eq((a2.generation, parts(a2)), (2, ["orders/0", "orders/2"]));
+    assert_eq(
+        groups.commit_offsets(c, "billing", "a", 2, [("orders", 0, 10), ("orders", 2, 7)]),
+        Result.Ok(2)
+    );
+    assert(groups.commit_offsets(c, "billing", "a", 2, [("orders", 1, 5)]).is_err());
+    assert_eq(groups.commit_offsets(c, "billing", "b", 2, [("orders", 1, 5)]), Result.Ok(1));
+    // b leaves: a gets everything back, with the committed offsets.
+    groups.leave_group(c, "billing", "b");
+    let a3 = groups.join_group(c, "billing", "a", ["orders"], counts).unwrap();
+    assert_eq(a3.generation, 3);
+    assert_eq(a3.owned.map(fn(o: groups.Owned) -> int { o.committed }), [10, 5, 7, -1]);
+    // Another group reads the same topic on its own.
+    let other = groups.join_group(c, "audit", "x", ["orders"], counts).unwrap();
+    assert_eq(other.owned.map(fn(o: groups.Owned) -> int { o.committed }), [-1, -1, -1, -1]);
+
+    // A member that stops heartbeating is dropped after the session (300 ms).
+    groups.join_group(c, "billing", "z", ["orders"], counts);
+    let end = time.now() + 1500;
+    var gen = 0;
+    while (time.now() < end) {
+        groups.heartbeat_of(c, "billing", "a", 0);
+        let v = groups.describe_group(c, "billing").unwrap();
+        gen = v.generation;
+        if (v.members.len() == 1) {
+            break;
+        }
+        time.sleep(50);
+    }
+    assert_eq(groups.describe_group(c, "billing").unwrap().members.len(), 1);
+    assert(gen >= 5);
+    groups.stop(c);
+
+    // The offsets are back after a restart (a torn last line is skipped).
+    fs.append_file("${dir}/offsets.log", "billing\torders\t3\t");
+    let c2 = groups.start(dir, 300).unwrap();
+    let back = groups.join_group(c2, "billing", "a", ["orders"], counts).unwrap();
+    assert_eq(back.owned.map(fn(o: groups.Owned) -> int { o.committed }), [10, 5, 7, -1]);
+    groups.stop(c2);
+    fs.remove_all(dir);
+}

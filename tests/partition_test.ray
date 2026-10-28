@@ -1,0 +1,191 @@
+// A partition on its own: appends across segments, reads from any offset, recovery from a torn
+// tail, a corrupt closed segment refused, long-poll, retention by size, and compaction.
+
+import std/fs;
+import std/time;
+import codec;
+import partition;
+
+fn rec(key: string, value: string) -> codec.Record {
+    codec.Record { offset: 0, ts: 0, key: key.to_bytes(), value: value.to_bytes() }
+}
+
+fn policy(segment_bytes: int) -> partition.Policy {
+    partition.Policy {
+        segment_bytes: segment_bytes,
+        retention_ms: 0,
+        retention_bytes: 0,
+        compact: false,
+        tombstone_ms: 0
+    }
+}
+
+fn values(rs: [codec.Record]) -> [string] {
+    rs.map(fn(r: codec.Record) -> string { from_utf8(r.value).unwrap_or("?") })
+}
+
+// Everything from `offset` to the end, following segments.
+fn read_all(p: Channel<partition.Msg>, offset: int) -> [codec.Record] {
+    var out: [codec.Record] = [];
+    var at = offset;
+    while (true) {
+        let (rs, next) = partition.read(p, at, 4096).unwrap();
+        if (rs.len() == 0) {
+            if (at >= next) {
+                return out;
+            }
+            return out;
+        }
+        out = out + rs;
+        at = rs[rs.len() - 1].offset + 1;
+    }
+}
+
+@test
+fn codec_round_trip() {
+    let r = codec.Record {
+        offset: 123456789012,
+        ts: 1793232000000,
+        key: "k".to_bytes(),
+        value: bytes_of([0, 255, 10, 13])
+    };
+    let b = codec.encode(r);
+    let d = codec.decode(bytes_concat([b, b.sub_bytes(0, 5)]), 0);
+    assert_eq((d.records.len(), d.used, d.stop), (1, b.len(), ""));
+    assert_eq(
+        (d.records[0].offset, d.records[0].ts, d.records[0].value),
+        (r.offset, r.ts, r.value)
+    );
+    // One flipped bit is a crc mismatch.
+    var xs: [int] = [];
+    for x in b {
+        xs.push(x);
+    }
+    xs[xs.len() - 1] = xs[xs.len() - 1] ^ 1;
+    assert(codec.decode(bytes_of(xs), 0).stop.starts_with("crc mismatch"));
+    assert_eq(codec.fnv1a("hello".to_bytes()), 0x4F9F2CAB);
+}
+
+@test
+fn appends_reads_and_recovery() {
+    let dir = fs.make_temp_dir("raybus-p").unwrap();
+    let (p, report) = partition.start(dir, policy(600)).unwrap();
+    assert_eq(report, "");
+    for i in 0..10 {
+        let (first, n) = partition.append(p, [rec("k${i}", "v${i * 3}"), rec("k${i}", "v${i * 3 + 1}"), rec("", "v${i * 3 + 2}")])
+            .unwrap();
+        assert_eq((first, n), (i * 3, 3));
+    }
+    let i = partition.info_of(p);
+    assert_eq((i.earliest, i.next), (0, 30));
+    assert(i.segments >= 2);
+    assert_eq(values(read_all(p, 0)).len(), 30);
+    assert_eq(values(read_all(p, 17))[0], "v17");
+    assert_eq(read_all(p, 30).len(), 0);
+    partition.stop(p);
+
+    // A crash mid-write: half a record at the end of the last segment.
+    let last = sort(fs.list_dir(dir).unwrap())[fs.list_dir(dir).unwrap().len() - 1];
+    let half = codec.encode(
+        codec.Record { offset: 30, ts: 1, key: bytes_of([]), value: "torn".to_bytes() }
+    );
+    fs.append_file_bytes("${dir}/${last}", half.sub_bytes(0, half.len() - 3));
+    let (p2, report2) = partition.start(dir, policy(600)).unwrap();
+    assert(report2.contains("cut ") && report2.contains("after offset 29"));
+    assert_eq(partition.info_of(p2).next, 30);
+    assert_eq(partition.append(p2, [rec("", "after")]).unwrap(), (30, 1));
+    assert_eq(values(read_all(p2, 29)), ["v29", "after"]);
+    partition.stop(p2);
+
+    // Corruption in a closed segment is not cut silently.
+    let first_seg = sort(fs.list_dir(dir).unwrap())[0];
+    let b = fs.read_file_bytes("${dir}/${first_seg}").unwrap();
+    var xs: [int] = [];
+    for x in b {
+        xs.push(x);
+    }
+    xs[20] = xs[20] ^ 0xFF;
+    fs.write_file_bytes("${dir}/${first_seg}", bytes_of(xs));
+    assert(partition.start(dir, policy(600)).is_err());
+    fs.remove_all(dir);
+}
+
+@test
+fn long_poll() {
+    let dir = fs.make_temp_dir("raybus-w").unwrap();
+    let (p, _) = partition.start(dir, policy(1 << 20)).unwrap();
+    let t0 = time.now();
+    assert_eq(partition.wait_past(p, 0, 150), 0);
+    assert(time.now() - t0 >= 140);
+    spawn(fn() {
+        time.sleep(50);
+        partition.append(p, [rec("", "x")]);
+    });
+    let t1 = time.now();
+    assert_eq(partition.wait_past(p, 0, 5000), 1);
+    assert(time.now() - t1 < 1000);
+    partition.stop(p);
+    fs.remove_all(dir);
+}
+
+@test
+fn retention_and_compaction() {
+    let dir = fs.make_temp_dir("raybus-c").unwrap();
+    let pol = partition.Policy {
+        segment_bytes: 400,
+        retention_ms: 0,
+        retention_bytes: 0,
+        compact: true,
+        tombstone_ms: 0
+    };
+    let (p, _) = partition.start(dir, pol).unwrap();
+    // Three keys rewritten again and again, one deleted (a tombstone), one record without a key.
+    for round in 0..8 {
+        partition.append(p, [rec("a", "a${round}"), rec("b", "b${round}"), rec("c", "c${round}")]);
+    }
+    partition.append(p, [rec("b", ""), rec("", "no key")]);
+    partition.append(p, [rec("a", "a-final")]);
+    let before = partition.info_of(p);
+    partition.housekeep_now(p);
+    let after = partition.info_of(p);
+    assert(after.size < before.size);
+    assert_eq(after.next, before.next);
+    // Reading the whole log after compaction: each key's newest value survives, in offset order.
+    let all = read_all(p, after.earliest);
+    let latest: Map<string, string> = Map.new();
+    var last_offset = -1;
+    for r in all {
+        assert(r.offset > last_offset);
+        last_offset = r.offset;
+        latest.insert(from_utf8(r.key).unwrap(), from_utf8(r.value).unwrap());
+    }
+    assert_eq(latest.get_or("a", ""), "a-final");
+    assert_eq(latest.get_or("c", ""), "c7");
+    assert(latest.get_or("b", "gone") == "gone" || latest.get_or("b", "") == "");
+    assert_eq(latest.get_or("", ""), "no key");
+    assert(all.len() < 27);
+    partition.stop(p);
+    fs.remove_all(dir);
+
+    // Retention by size drops the oldest segments, never the active one.
+    let dir2 = fs.make_temp_dir("raybus-r").unwrap();
+    let (q, _) = partition.start(dir2, partition.Policy {
+        segment_bytes: 300,
+        retention_ms: 0,
+        retention_bytes: 700,
+        compact: false,
+        tombstone_ms: 0
+    })
+        .unwrap();
+    for i in 0..40 {
+        partition.append(q, [rec("", "value number ${i}")]);
+    }
+    partition.housekeep_now(q);
+    let i = partition.info_of(q);
+    assert(i.earliest > 0 && i.size <= 700 + 300);
+    assert_eq(i.next, 40);
+    assert_eq(values(read_all(q, i.earliest))[0], "value number ${i.earliest}");
+    assert(partition.read(q, 0, 100).is_err());
+    partition.stop(q);
+    fs.remove_all(dir2);
+}

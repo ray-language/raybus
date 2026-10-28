@@ -1,0 +1,75 @@
+//! Everything together: the topics (a fiber per partition), the group coordinator, the API.
+
+import std/fs;
+import std/net;
+import net/webserver;
+import api;
+import config;
+import groups;
+import topics;
+
+pub struct Running {
+    port: int,
+    tb: Channel<topics.Msg>,
+    gc: Channel<groups.Msg>,
+    stop: Channel<int>,
+    done: Channel<Result<int, string>>,
+    /// What recovery cut at start (torn tails of a crash).
+    recovered: [string],
+    lock: int,
+}
+
+pub fn start(cfg: config.Config, listener: int) -> Result<Running, string> {
+    fs.mkdir(cfg.data)?;
+    // Two raybus on one directory would interleave writes: the second one is refused.
+    let lock = fs.open("${cfg.data}/LOCK", "a")?;
+    if (!fs.try_lock(lock)?) {
+        close(lock);
+        return Result.Err("${cfg.data} is in use by another raybus");
+    }
+    let (tb, recovered) = topics.start(cfg.data)?;
+    let gc = groups.start(cfg.data, cfg.session_ms)?;
+    let stop: Channel<int> = Channel.bounded(1);
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    let ctx = api.Ctx { cfg: cfg, tb: tb, gc: gc };
+    spawn(fn() {
+        var opts = webserver.options();
+        var limits = webserver.default_limits();
+        limits.max_body_bytes = 64 * 1024 * 1024;
+        limits.read_timeout_millis = 60000;
+        opts.limits = limits;
+        opts.drain_ms = 2000;
+        opts.stop = stop;
+        opts.has_stop = true;
+        opts.no_stdout = true;
+        let r = webserver.serve_options_on(
+            listener,
+            opts,
+            fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { api.handle(ctx, req) }
+            }
+        );
+        send(done, r);
+    });
+    Result.Ok(
+        Running {
+            port: net.local_port(listener),
+            tb: tb,
+            gc: gc,
+            stop: stop,
+            done: done,
+            recovered: recovered,
+            lock: lock
+        }
+    )
+}
+
+pub fn stop(r: Running) {
+    send(r.stop, 1);
+    recv(r.done);
+    topics.stop(r.tb);
+    groups.stop(r.gc);
+    // Only now that nothing writes any more.
+    fs.unlock(r.lock);
+    close(r.lock);
+}

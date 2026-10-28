@@ -1,0 +1,408 @@
+//! Consumer groups: who is in each group, which partitions each member reads, and where the group
+//! has got to. One fiber owns it all.
+//!
+//! - A member joins with the topics it reads. Any change of membership (a join with new topics, a
+//!   leave, a member whose session ran out) starts a new generation and deals the partitions out
+//!   again: per topic, partition i goes to the i-th member (sorted by id), round the table.
+//! - A heartbeat with an old generation answers `rebalance`: the member joins again to learn its
+//!   new partitions.
+//! - A commit is accepted only from the member that owns the partition in the current generation,
+//!   so a member that lost a partition in a rebalance cannot move the group's offset.
+//! - Commits go to `<data>/offsets.log` (one line each, synced before answering), replayed at start
+//!   and rewritten when it grows.
+
+import std/fs;
+import std/time;
+
+pub struct Owned {
+    topic: string,
+    partition: int,
+    /// The offset to read next: the committed one, or -1 if the group has none.
+    committed: int,
+}
+
+pub struct Joined {
+    generation: int,
+    owned: [Owned],
+}
+
+pub struct MemberView {
+    id: string,
+    topics: [string],
+    owned: [(string, int)],
+    idle_ms: int,
+}
+
+pub struct GroupView {
+    generation: int,
+    members: [MemberView],
+    committed: [(string, int, int)],
+}
+
+pub enum Msg {
+    /// Group, member, topics, and each topic's partition count.
+    Join(string, string, [string], [(string, int)], Channel<Result<Joined, string>>),
+    Heartbeat(string, string, int, Channel<Result<string, string>>),
+    Leave(string, string, Channel<Result<int, string>>),
+    Commit(string, string, int, [(string, int, int)], Channel<Result<int, string>>),
+    Describe(string, Channel<Option<GroupView>>),
+    Stop(Channel<int>),
+}
+
+struct Member {
+    topics: [string],
+    seen_ms: int,
+}
+
+struct Group {
+    generation: int,
+    members: Map<string, Member>,
+    counts: Map<string, int>,
+    owner: Map<string, string>,
+}
+
+struct G {
+    groups: Map<string, Group>,
+    committed: Map<string, int>,
+    log: int,
+    path: string,
+    lines: int,
+    session_ms: int,
+}
+
+fn ckey(group: string, topic: string, p: int) -> string {
+    "${group}\t${topic}\t${p}"
+}
+
+fn pkey(topic: string, p: int) -> string {
+    "${topic}\t${p}"
+}
+
+const REWRITE_AFTER: int = 100000;
+
+pub fn start(data: string, session_ms: int) -> Result<Channel<Msg>, string> {
+    let path = "${data}/offsets.log";
+    let committed: Map<string, int> = Map.new();
+    if (fs.exists(path)) {
+        for line in fs.read_file(path)?.split(
+            "\n"
+        ) {
+            let f = line.split("\t");
+            // A line cut short by a crash has fewer fields or no number: skip it.
+            if (f.len() == 4) {
+                match (parse_int(f[3])) {
+                    Option.Some(o) => committed.insert(ckey(f[0], f[1], parse_int(f[2]).unwrap_or(0)), o),
+                    Option.None => { },
+                }
+            }
+        }
+    }
+    let g = G {
+        groups: Map.new(),
+        committed: committed,
+        log: 0,
+        path: path,
+        lines: 0,
+        session_ms: session_ms
+    };
+    rewrite(g)?;
+    let inbox: Channel<Msg> = Channel.bounded(1024);
+    spawn(fn() {
+        serve(g, inbox);
+    });
+    Result.Ok(inbox)
+}
+
+// The offsets file with one line per partition, replacing the log of every commit.
+fn rewrite(g: G) -> Result<int, string> {
+    if (g.log != 0) {
+        close(g.log);
+    }
+    var lines: [string] = [];
+    for k in sort(g.committed.keys()) {
+        lines.push("${k}\t${g.committed.get_or(k, 0)}");
+    }
+    let tmp = g.path + ".tmp";
+    let h = fs.open(tmp, "w")?;
+    fs.write(h, if (lines.len() == 0) { "" } else { join(lines, "\n") + "\n" })?;
+    fs.sync(h)?;
+    close(h);
+    fs.rename(tmp, g.path)?;
+    g.log = fs.open(g.path, "a")?;
+    g.lines = lines.len();
+    Result.Ok(0)
+}
+
+fn serve(g: G, inbox: Channel<Msg>) {
+    while (true) {
+        match (select_timeout([inbox], 200)) {
+            Option.Some(_) => match (recv(inbox)) {
+                Option.Some(m) => if (!handle(g, m)) {
+                    return;
+                },
+                Option.None => return,
+            },
+            Option.None => { },
+        }
+        expire(g, time.now());
+    }
+}
+
+fn handle(g: G, m: Msg) -> bool {
+    match (m) {
+        Msg.Join(group, member, topics, counts, reply) => {
+            let r = add_member(g, group, member, topics, counts);
+            send(reply, r);
+        },
+        Msg.Heartbeat(group, member, generation, reply) => {
+            let r = heartbeat(g, group, member, generation);
+            send(reply, r);
+        },
+        Msg.Leave(group, member, reply) => {
+            let r = leave(g, group, member);
+            send(reply, r);
+        },
+        Msg.Commit(group, member, generation, offsets, reply) => {
+            let r = commit(g, group, member, generation, offsets);
+            send(reply, r);
+        },
+        Msg.Describe(group, reply) => send(reply, describe(g, group)),
+        Msg.Stop(reply) => {
+            close(g.log);
+            send(reply, 0);
+            return false;
+        },
+    }
+    true
+}
+
+// Deals every topic's partitions out to the members that read it.
+fn assign(gr: Group) {
+    let owner: Map<string, string> = Map.new();
+    for topic in sort(gr.counts.keys()) {
+        let readers = sort(
+            gr.members.keys()
+        ).filter(fn(id: string) -> bool { gr.members.get(id).unwrap().topics.contains(topic) });
+        if (readers.len() == 0) {
+            continue;
+        }
+        for p in 0..gr.counts.get_or(topic, 0) {
+            owner.insert(pkey(topic, p), readers[p % readers.len()]);
+        }
+    }
+    gr.owner = owner;
+    gr.generation = gr.generation + 1;
+}
+
+fn owned_by(g: G, group: string, gr: Group, member: string) -> [Owned] {
+    var out: [Owned] = [];
+    for k in sort(gr.owner.keys()) {
+        if (gr.owner.get_or(k, "") == member) {
+            let f = k.split("\t");
+            let p = parse_int(f[1]).unwrap_or(0);
+            out.push(
+                Owned {
+                    topic: f[0],
+                    partition: p,
+                    committed: g.committed.get_or(ckey(group, f[0], p), -1)
+                }
+            );
+        }
+    }
+    out
+}
+
+fn add_member(
+    g: G,
+    group: string,
+    member: string,
+    topics: [string],
+    counts: [(string, int)]
+) -> Result<Joined, string> {
+    if (member == "" || topics.len() == 0) {
+        return Result.Err("a member id and at least one topic");
+    }
+    let gr = g.groups.get_or(
+        group,
+        Group { generation: 0, members: Map.new(), counts: Map.new(), owner: Map.new() }
+    );
+    let now = time.now();
+    var changed = false;
+    match (gr.members.get(member)) {
+        Option.Some(m) => {
+            m.seen_ms = now;
+            if (sort(m.topics) != sort(topics)) {
+                m.topics = topics;
+                changed = true;
+            }
+        },
+        Option.None => {
+            gr.members.insert(member, Member { topics: topics, seen_ms: now });
+            changed = true;
+        },
+    }
+    for (t, n) in counts {
+        if (gr.counts.get_or(t, -1) != n) {
+            gr.counts.insert(t, n);
+            changed = true;
+        }
+    }
+    if (changed) {
+        assign(gr);
+    }
+    g.groups.insert(group, gr);
+    Result.Ok(Joined { generation: gr.generation, owned: owned_by(g, group, gr, member) })
+}
+
+fn heartbeat(g: G, group: string, member: string, generation: int) -> Result<string, string> {
+    let gr = g.groups.get(group).ok_or("unknown group")?;
+    let m = gr.members.get(member).ok_or("unknown member: join again")?;
+    m.seen_ms = time.now();
+    Result.Ok(if (generation == gr.generation) { "ok" } else { "rebalance" })
+}
+
+fn leave(g: G, group: string, member: string) -> Result<int, string> {
+    let gr = g.groups.get(group).ok_or("unknown group")?;
+    if (!gr.members.contains_key(member)) {
+        return Result.Err("unknown member");
+    }
+    gr.members.remove(member);
+    assign(gr);
+    Result.Ok(gr.generation)
+}
+
+fn commit(
+    g: G,
+    group: string,
+    member: string,
+    generation: int,
+    offsets: [(string, int, int)]
+) -> Result<int, string> {
+    let gr = g.groups.get(group).ok_or("unknown group")?;
+    if (!gr.members.contains_key(member)) {
+        return Result.Err("unknown member: join again");
+    }
+    if (generation != gr.generation) {
+        return Result.Err("stale generation ${generation} (now ${gr.generation}): join again");
+    }
+    for (t, p, _) in offsets {
+        if (gr.owner.get_or(pkey(t, p), "") != member) {
+            return Result.Err("${t}/${p} is not assigned to ${member}");
+        }
+    }
+    var lines: [string] = [];
+    for (t, p, o) in offsets {
+        lines.push("${ckey(group, t, p)}\t${o}");
+    }
+    fs.write(g.log, join(lines, "\n") + "\n")?;
+    fs.sync_data(g.log)?;
+    for (t, p, o) in offsets {
+        g.committed.insert(ckey(group, t, p), o);
+    }
+    g.lines = g.lines + lines.len();
+    if (g.lines > REWRITE_AFTER) {
+        rewrite(g)?;
+    }
+    Result.Ok(offsets.len())
+}
+
+// Members whose session ran out leave, and their groups rebalance.
+fn expire(g: G, now: int) {
+    for name in g.groups.keys() {
+        let gr = g.groups.get(name).unwrap();
+        var gone = false;
+        for id in gr.members.keys() {
+            if (now - gr.members.get(id).unwrap().seen_ms > g.session_ms) {
+                gr.members.remove(id);
+                gone = true;
+            }
+        }
+        if (gone) {
+            assign(gr);
+        }
+    }
+}
+
+fn describe(g: G, group: string) -> Option<GroupView> {
+    let now = time.now();
+    let gr = g.groups.get(group)?;
+    var members: [MemberView] = [];
+    for id in sort(gr.members.keys()) {
+        let m = gr.members.get(id).unwrap();
+        let owned = owned_by(
+            g,
+            group,
+            gr,
+            id
+        ).map(fn(o: Owned) -> (string, int) { (o.topic, o.partition) });
+        members.push(
+            MemberView { id: id, topics: m.topics, owned: owned, idle_ms: now - m.seen_ms }
+        );
+    }
+    var committed: [(string, int, int)] = [];
+    for k in sort(g.committed.keys()) {
+        let f = k.split("\t");
+        if (f[0] == group) {
+            committed.push((f[1], parse_int(f[2]).unwrap_or(0), g.committed.get_or(k, 0)));
+        }
+    }
+    Option.Some(GroupView { generation: gr.generation, members: members, committed: committed })
+}
+
+// --- The client side ---
+
+pub fn join_group(
+    c: Channel<Msg>,
+    group: string,
+    member: string,
+    topics: [string],
+    counts: [(string, int)]
+) -> Result<Joined, string> {
+    let r: Channel<Result<Joined, string>> = Channel.bounded(1);
+    send(c, Msg.Join(group, member, topics, counts, r));
+    recv(r).unwrap_or(Result.Err("groups stopped"))
+}
+
+pub fn heartbeat_of(
+    c: Channel<Msg>,
+    group: string,
+    member: string,
+    generation: int
+) -> Result<string, string> {
+    let r: Channel<Result<string, string>> = Channel.bounded(1);
+    send(c, Msg.Heartbeat(group, member, generation, r));
+    recv(r).unwrap_or(Result.Err("groups stopped"))
+}
+
+pub fn leave_group(c: Channel<Msg>, group: string, member: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(c, Msg.Leave(group, member, r));
+    recv(r).unwrap_or(Result.Err("groups stopped"))
+}
+
+pub fn commit_offsets(
+    c: Channel<Msg>,
+    group: string,
+    member: string,
+    generation: int,
+    offsets: [(string, int, int)]
+) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(c, Msg.Commit(group, member, generation, offsets, r));
+    recv(r).unwrap_or(Result.Err("groups stopped"))
+}
+
+pub fn describe_group(c: Channel<Msg>, group: string) -> Option<GroupView> {
+    let r: Channel<Option<GroupView>> = Channel.bounded(1);
+    send(c, Msg.Describe(group, r));
+    match (recv(r)) {
+        Option.Some(v) => v,
+        Option.None => Option.None,
+    }
+}
+
+pub fn stop(c: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(c, Msg.Stop(r));
+    recv(r);
+}

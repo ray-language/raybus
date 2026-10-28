@@ -1,0 +1,299 @@
+//! raybus: a retained log with offsets and consumer groups.
+
+import std/json;
+import std/net;
+import std/time;
+import net/webserver;
+import client;
+import config;
+import server;
+
+const VERSION: string = "0.1.0";
+
+fn usage() -> string {
+    `raybus ${VERSION} — a retained log: topics, partitions, offsets, consumer groups
+
+  raybus serve [--config raybus.toml]
+  raybus create TOPIC [--partitions N] [--compact]
+  raybus produce TOPIC [--key K]           one record per line of stdin ("key<TAB>value" with --tab)
+  raybus consume TOPIC... --group G [--member ID]
+                                           print records as a member of G, committing as it goes
+  raybus tail TOPIC [--partition P] [--from earliest|latest|N]   follow one partition, no group
+  raybus topics | group G
+  raybus bench TOPIC [-n RECORDS] [-c CLIENTS] [-b RECORDS_PER_REQUEST] [--size BYTES]
+  --api URL (RAYBUS_API, default http://127.0.0.1:9500), --token T (RAYBUS_TOKEN)
+`
+}
+
+fn flag(argv: [string], name: string, default: string) -> string {
+    for i in 0..argv.len() {
+        if (argv[i] == name && i + 1 < argv.len()) {
+            return argv[i + 1];
+        }
+    }
+    default
+}
+
+fn has(argv: [string], name: string) -> bool {
+    argv.contains(name)
+}
+
+const SWITCHES: [string] = ["--compact", "--tab"];
+
+fn positional(argv: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 1;
+    while (i < argv.len()) {
+        if (SWITCHES.contains(argv[i])) {
+            i = i + 1;
+        } else if (argv[i].starts_with("-")) {
+            i = i + 2;
+        } else {
+            out.push(argv[i]);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn env_or(name: string, default: string) -> string {
+    match (env(name)) {
+        Option.Some(v) => if (v == "") { default } else { v },
+        Option.None => default,
+    }
+}
+
+fn conn(argv: [string]) -> client.Conn {
+    client.Conn {
+        api: flag(argv, "--api", env_or("RAYBUS_API", "http://127.0.0.1:9500")),
+        token: flag(argv, "--token", env_or("RAYBUS_TOKEN", ""))
+    }
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let path = flag(argv, "--config", "raybus.toml");
+    let cfg = config.load(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    let l = net.tcp_listen(cfg.host, cfg.port)?;
+    let r = server.start(cfg, l)?;
+    for line in r.recovered {
+        eprint("raybus: recovered ${line}");
+    }
+    print(
+        "raybus ${VERSION}: http://${cfg.host}:${r.port}, data in ${cfg.data}, retention ${cfg.retention_ms / 3600000} h, segments of ${cfg.segment_bytes / 1048576} MiB, group sessions of ${cfg.session_ms} ms"
+    );
+    recv(webserver.shutdown_signals());
+    server.stop(r);
+    print("raybus: stopped");
+    Result.Ok(0)
+}
+
+fn need_topic(argv: [string]) -> Result<string, string> {
+    let pos = positional(argv);
+    if (pos.len() == 0) { Result.Err("missing TOPIC") } else { Result.Ok(pos[0]) }
+}
+
+fn produce(argv: [string]) -> Result<int, string> {
+    let topic = need_topic(argv)?;
+    let key = flag(argv, "--key", "");
+    let tab = has(argv, "--tab");
+    var batch: [(string, string)] = [];
+    var total = 0;
+    let c = conn(argv);
+    while (true) {
+        match (input()) {
+            Option.Some(line) => {
+                if (tab && line.contains("\t")) {
+                    let i = line.index_of("\t").unwrap_or(0);
+                    batch.push((line.substring(0, i), line.substring(i + 1, line.len())));
+                } else {
+                    batch.push((key, line));
+                }
+                if (batch.len() >= 500) {
+                    total = total + client.produce(c, topic, batch)?.len();
+                    batch = [];
+                }
+            },
+            Option.None => break,
+        }
+    }
+    if (batch.len() > 0) {
+        total = total + client.produce(c, topic, batch)?.len();
+    }
+    eprint("raybus: ${total} record(s) to ${topic}");
+    Result.Ok(0)
+}
+
+fn consume(argv: [string]) -> Result<int, string> {
+    let topics = positional(argv);
+    let group = flag(argv, "--group", "");
+    if (topics.len() == 0 || group == "") {
+        return Result.Err("consume needs TOPIC... and --group G");
+    }
+    let member = flag(argv, "--member", "m-${time.now() % 1000000}");
+    let out: Channel<client.Rec> = Channel.bounded(1000);
+    let stop: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        recv(webserver.shutdown_signals());
+        close(stop);
+    });
+    let c = conn(argv);
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        let r = client.consume(c, group, member, topics, client.Sink { out: out, stop: stop });
+        send(done, r);
+        close(out);
+    });
+    while (true) {
+        match (recv(out)) {
+            Option.Some(r) => print("${r.topic}/${r.partition}@${r.offset}\t${r.key}\t${r.value}"),
+            Option.None => break,
+        }
+    }
+    recv(done).unwrap_or(Result.Ok(0))?;
+    Result.Ok(0)
+}
+
+fn tail(argv: [string]) -> Result<int, string> {
+    let topic = need_topic(argv)?;
+    let p = parse_int(flag(argv, "--partition", "0")).unwrap_or(0);
+    var at = flag(argv, "--from", "latest");
+    let c = conn(argv);
+    while (true) {
+        let (recs, next) = client.fetch(c, topic, p, at, "10s")?;
+        for r in recs {
+            print("${topic}/${p}@${r.offset}\t${r.key}\t${r.value}");
+        }
+        at = to_string(next);
+    }
+}
+
+fn topics_cmd(argv: [string]) -> Result<int, string> {
+    let j = client.call(conn(argv), "GET", "/v1/topics", json.Json.JNull)?;
+    for t in json.get_array(j, "topics")
+        .unwrap_or([]) {
+        let parts = json.get_array(t, "partitions").unwrap_or([]);
+        var total = 0;
+        for p in parts {
+            total = total + json.get_int(p, "next")
+                .unwrap_or(0) - json.get_int(p, "earliest").unwrap_or(0);
+        }
+        print(
+            "${json.get_string(t, "topic").unwrap_or("?")}  ${parts.len()} partitions, ${total} records${if (json.get_bool(t, "compact").unwrap_or(false)) { ", compacted" } else { "" }}"
+        );
+    }
+    Result.Ok(0)
+}
+
+fn group_cmd(argv: [string]) -> Result<int, string> {
+    let g = need_topic(argv)?;
+    print(
+        json.stringify_pretty(
+            client.call(conn(argv), "GET", "/v1/groups/${g}", json.Json.JNull)?,
+            2
+        )
+    );
+    Result.Ok(0)
+}
+
+fn bench(argv: [string]) -> Result<int, string> {
+    let topic = need_topic(argv)?;
+    let n = parse_int(flag(argv, "-n", "200000")).unwrap_or(200000);
+    let cl = parse_int(flag(argv, "-c", "8")).unwrap_or(8);
+    let b = parse_int(flag(argv, "-b", "500")).unwrap_or(500);
+    let size = parse_int(flag(argv, "--size", "100")).unwrap_or(100);
+    let c = conn(argv);
+    let payload = "x".repeat(size);
+    let per = n / cl / b;
+    let done: Channel<int> = Channel.bounded(cl);
+    let t0 = time.now();
+    for w in 0..cl {
+        spawn(fn() {
+            var ok = 0;
+            for i in 0..per {
+                var batch: [(string, string)] = [];
+                for j in 0..b {
+                    batch.push(("k${(w * 7919 + i * b + j) % 10000}", payload));
+                }
+                match (client.produce(c, topic, batch)) {
+                    Result.Ok(xs) => ok = ok + xs.len(),
+                    Result.Err(e) => eprint("raybus bench: ${e}"),
+                }
+            }
+            send(done, ok);
+        });
+    }
+    var ok = 0;
+    for _ in 0..cl {
+        ok = ok + recv(done).unwrap_or(0);
+    }
+    let ms = time.now() - t0;
+    print(
+        "produced ${ok} records of ${size} bytes in ${ms} ms: ${if (ms > 0) { ok * 1000 / ms } else { 0 }} records/s (${cl} clients × ${b} per request, each acknowledged after fsync)"
+    );
+    // Read everything back, partition by partition.
+    let j = client.call(c, "GET", "/v1/topics", json.Json.JNull)?;
+    var parts = 0;
+    for t in json.get_array(j, "topics").unwrap_or([]) {
+        if (json.get_string(t, "topic").unwrap_or("") == topic) {
+            parts = json.get_array(t, "partitions").unwrap_or([]).len();
+        }
+    }
+    let t1 = time.now();
+    var read = 0;
+    for p in 0..parts {
+        var at = "earliest";
+        while (true) {
+            let (recs, next) = client.fetch(c, topic, p, at, "0s")?;
+            if (recs.len() == 0) {
+                break;
+            }
+            read = read + recs.len();
+            at = to_string(next);
+        }
+    }
+    let ms2 = time.now() - t1;
+    print(
+        "read back ${read} records in ${ms2} ms: ${if (ms2 > 0) { read * 1000 / ms2 } else { 0 }} records/s (one reader, 1 MiB per fetch)"
+    );
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "--help" || argv[0] == "-h") {
+        print(usage());
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    let r = match (argv[0]) {
+        "serve" => serve(argv),
+        "create" => {
+            let t = need_topic(argv);
+            match (t) {
+                Result.Ok(topic) => client.create_topic(conn(argv), topic, parse_int(flag(argv, "--partitions", "1")).unwrap_or(1), has(argv, "--compact"))
+                    .map(fn(j: json.Json) -> int {
+                    print(json.stringify(j));
+                    0
+                }),
+                Result.Err(e) => Result.Err(e),
+            }
+        },
+        "produce" => produce(argv),
+        "consume" => consume(argv),
+        "tail" => tail(argv),
+        "topics" => topics_cmd(argv),
+        "group" => group_cmd(argv),
+        "bench" => bench(argv),
+        "--version" => {
+            print(VERSION);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${usage()}"),
+    };
+    match (r) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("raybus: ${e}");
+            1
+        },
+    }
+}

@@ -1,0 +1,9 @@
+# raybus configuration. Copy to raybus.toml.
+
+[server]
+listen = "127.0.0.1:9500"
+data = "data"
+retention = "7d"        # default for new topics ("0s" = forever)
+segment_mb = 64         # a segment rolls at this size
+session = "10s"         # a group member that does not heartbeat for this long is out
+token = ""              # bearer token for every request ("" = open)

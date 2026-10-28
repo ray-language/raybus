@@ -1,0 +1,162 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers): keyed records on
+// partitions, fetch and long-poll, a consumer group that rebalances when a member leaves (every
+// record delivered at least once, in order per partition), the directory lock, and committed
+// offsets after a restart.
+
+import std/fs;
+import std/json;
+import std/net;
+import std/time;
+import client;
+import config;
+import server;
+
+fn boot(data: string) -> (server.Running, client.Conn) {
+    let cfg = config.parse("[server]\nlisten = \"127.0.0.1:0\"\ndata = \"${data}\"\nsession = \"2s\"\nsegment_mb = 1\n")
+        .unwrap();
+    let r = server.start(cfg, net.tcp_listen("127.0.0.1", 0).unwrap()).unwrap();
+    (r, client.Conn { api: "http://127.0.0.1:${r.port}", token: "" })
+}
+
+// Pulls from `got` until `want` distinct (partition, offset) were seen, or `ms` pass.
+fn gather(
+    got: Channel<client.Rec>,
+    seen: [client.Rec],
+    unique: Map<string, bool>,
+    want: int,
+    ms: int
+) {
+    let end = time.now() + ms;
+    while (unique.len() < want && time.now() < end) {
+        match (select_timeout([got], 200)) {
+            Option.Some(_) => {
+                let x = recv(got).unwrap();
+                unique.insert("${x.partition}/${x.offset}", true);
+                seen.push(x);
+            },
+            Option.None => { },
+        }
+    }
+}
+
+// A member consuming until told to stop; what it got comes back on `got`.
+fn member(
+    c: client.Conn,
+    id: string,
+    got: Channel<client.Rec>,
+    stop: Channel<int>
+) -> Channel<Result<int, string>> {
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(
+            done,
+            client.consume(c, "billing", id, ["orders"], client.Sink { out: got, stop: stop })
+        );
+    });
+    done
+}
+
+@test
+fn bus_end_to_end() {
+    let data = fs.make_temp_dir("raybus-e2e").unwrap();
+    let (r, c) = boot(data);
+    assert(client.create_topic(c, "orders", 3, false).is_ok());
+    assert(client.create_topic(c, "orders", 3, false).is_ok());
+    assert(client.create_topic(c, "orders", 4, false).is_err());
+
+    // The same key always lands on the same partition, in order.
+    var batch: [(string, string)] = [];
+    for i in 0..300 {
+        batch.push(("customer-${i % 10}", "order ${i}"));
+    }
+    let offs = client.produce(c, "orders", batch).unwrap();
+    assert_eq(offs.len(), 300);
+    let (p0, _) = offs[0];
+    let (p10, _) = offs[10];
+    assert_eq(p0, p10);
+
+    // Fetch, and a long-poll woken by a produce.
+    let (recs, next) = client.fetch(c, "orders", p0, "earliest", "0s").unwrap();
+    assert(recs.len() > 0 && next > 0);
+    assert_eq(recs[0].offset, 0);
+    let (none, _) = client.fetch(c, "orders", 0, "latest", "0s").unwrap();
+    assert_eq(none.len(), 0);
+    spawn(fn() {
+        time.sleep(100);
+        client.produce(c, "orders", [("customer-0", "late")]);
+    });
+    let t0 = time.now();
+    let (woken, _) = client.fetch(c, "orders", p0, "latest", "5s").unwrap();
+    assert_eq(woken[0].value, "late");
+    assert(time.now() - t0 < 3000);
+
+    // A group of two; one leaves halfway.
+    let got: Channel<client.Rec> = Channel.bounded(10000);
+    let stop_a: Channel<int> = Channel.bounded(1);
+    let stop_b: Channel<int> = Channel.bounded(1);
+    let done_a = member(c, "a", got, stop_a);
+    let done_b = member(c, "b", got, stop_b);
+    let seen: [client.Rec] = [];
+    let unique: Map<string, bool> = Map.new();
+    gather(got, seen, unique, 301, 10000);
+    close(stop_b);
+    recv(done_b);
+    var more: [(string, string)] = [];
+    for i in 0..60 {
+        more.push(("customer-${i % 10}", "after ${i}"));
+    }
+    client.produce(c, "orders", more);
+    gather(got, seen, unique, 361, 10000);
+    close(stop_a);
+    recv(done_a);
+    // At least once: every (partition, offset) produced was seen.
+    assert_eq(unique.len(), 361);
+    // In order within a partition, per member stretch: a redelivery goes back, never skips ahead.
+    let last: Map<int, int> = Map.new();
+    for x in seen {
+        let prev = last.get_or(x.partition, -1);
+        assert(x.offset <= prev + 1);
+        last.insert(x.partition, x.offset);
+    }
+    let g = client.call(c, "GET", "/v1/groups/billing", json.Json.JNull).unwrap();
+    assert(json.get_int(g, "generation").unwrap() >= 3);
+
+    // A second raybus on the same directory is refused.
+    let cfg2 = config.parse("[server]\nlisten = \"127.0.0.1:0\"\ndata = \"${data}\"\n").unwrap();
+    assert(server.start(cfg2, net.tcp_listen("127.0.0.1", 0).unwrap()).is_err());
+    server.stop(r);
+
+    // After a restart: the log is all there, and the group starts where it committed.
+    let (r2, c2) = boot(data);
+    let j = client.call(c2, "GET", "/v1/topics", json.Json.JNull).unwrap();
+    var total = 0;
+    for p in json.get_array(json.get_array(j, "topics").unwrap()[0], "partitions").unwrap() {
+        total = total + json.get_int(p, "next").unwrap();
+    }
+    assert_eq(total, 361);
+    client.produce(c2, "orders", [("customer-3", "new after restart")]);
+    let got2: Channel<client.Rec> = Channel.bounded(1000);
+    let stop_c: Channel<int> = Channel.bounded(1);
+    let done_c = member(c2, "c", got2, stop_c);
+    var fresh: [client.Rec] = [];
+    let end3 = time.now() + 5000;
+    while (time.now() < end3 && fresh.len() < 1) {
+        match (select_timeout([got2], 200)) {
+            Option.Some(_) => fresh.push(recv(got2).unwrap()),
+            Option.None => { },
+        }
+    }
+    time.sleep(500);
+    while (true) {
+        match (try_recv(got2)) {
+            Received.Got(x) => fresh.push(x),
+            _ => break,
+        }
+    }
+    close(stop_c);
+    recv(done_c);
+    assert_eq(fresh.len(), 1);
+    assert_eq(fresh[0].value, "new after restart");
+    server.stop(r2);
+    fs.remove_all(data);
+}

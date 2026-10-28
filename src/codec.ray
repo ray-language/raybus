@@ -1,0 +1,108 @@
+//! A record on disk:
+//!
+//! ```
+//! u32 len   u32 crc32   u64 offset   u64 ts_ms   u16 key_len   key   value
+//!           └──────────────────── crc32 and len cover this ────────────────┘
+//! ```
+//!
+//! Big-endian. `len` is everything after the crc. A record whose crc does not match, or that
+//! runs past the end of what was read, is where a log stops being trustworthy.
+
+import std/collections/bytesbuilder as bb;
+import std/inflate;
+
+pub struct Record {
+    offset: int,
+    ts: int,
+    key: bytes,
+    value: bytes,
+}
+
+pub const HEADER: int = 8;
+
+pub const MAX_RECORD: int = 16 * 1024 * 1024;
+
+fn put_u(b: bb.BytesBuilder, n: int, width: int) {
+    var i = width - 1;
+    while (i >= 0) {
+        bb.push_byte(b, (n >> (8 * i)) & 0xFF);
+        i = i - 1;
+    }
+}
+
+fn get_u(b: bytes, at: int, width: int) -> int {
+    var n = 0;
+    for i in 0..width {
+        n = (n << 8) | b[at + i];
+    }
+    n
+}
+
+pub fn encode(r: Record) -> bytes {
+    let body = bb.new();
+    put_u(body, r.offset, 8);
+    put_u(body, r.ts, 8);
+    put_u(body, r.key.len(), 2);
+    bb.push(body, r.key);
+    bb.push(body, r.value);
+    let payload = bb.build(body);
+    let out = bb.new();
+    put_u(out, payload.len(), 4);
+    put_u(out, inflate.crc32(payload), 4);
+    bb.push(out, payload);
+    bb.build(out)
+}
+
+/// What decoding a buffer found: the whole records, how many bytes they took, and why it
+/// stopped early ("" = it ran out of whole records, which is normal at a read boundary).
+pub struct Decoded {
+    records: [Record],
+    used: int,
+    stop: string,
+}
+
+/// Decodes the records in `b` from `at`.
+pub fn decode(b: bytes, at: int) -> Decoded {
+    var out: [Record] = [];
+    var pos = at;
+    while (pos + HEADER <= b.len()) {
+        let len = get_u(b, pos, 4);
+        if (len < 18 || len > MAX_RECORD) {
+            return Decoded {
+                records: out,
+                used: pos - at,
+                stop: "bad length ${len} at byte ${pos}"
+            };
+        }
+        if (pos + HEADER + len > b.len()) {
+            break;
+        }
+        let payload = b.sub_bytes(pos + HEADER, pos + HEADER + len);
+        if (inflate.crc32(payload) != get_u(b, pos + 4, 4)) {
+            return Decoded { records: out, used: pos - at, stop: "crc mismatch at byte ${pos}" };
+        }
+        let klen = get_u(payload, 16, 2);
+        if (18 + klen > len) {
+            return Decoded { records: out, used: pos - at, stop: "bad key length at byte ${pos}" };
+        }
+        out.push(
+            Record {
+                offset: get_u(payload, 0, 8),
+                ts: get_u(payload, 8, 8),
+                key: payload.sub_bytes(18, 18 + klen),
+                value: payload.sub_bytes(18 + klen, len)
+            }
+        );
+        pos = pos + HEADER + len;
+    }
+    Decoded { records: out, used: pos - at, stop: "" }
+}
+
+/// FNV-1a, for spreading keys over partitions (stable across runs and engines).
+pub fn fnv1a(b: bytes) -> int {
+    var h = 0x811C9DC5;
+    for x in b {
+        h = ((h ^ x) * 0x01000193) & 0xFFFFFFFF;
+    }
+    h
+}

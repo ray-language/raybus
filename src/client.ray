@@ -1,0 +1,241 @@
+//! A client of the API: produce, fetch, and a group consumer that joins, reads its partitions,
+//! commits after handing records on (at least once), heartbeats, and joins again when the group
+//! rebalances.
+
+import std/json;
+import std/time;
+import std/url;
+import net/http;
+
+pub struct Rec {
+    topic: string,
+    partition: int,
+    offset: int,
+    key: string,
+    value: string,
+}
+
+pub struct Conn {
+    api: string,
+    token: string,
+}
+
+fn headers(c: Conn) -> [(string, string)] {
+    var h = [("Content-Type", "application/json")];
+    if (c.token != "") {
+        h.push(("Authorization", "Bearer ${c.token}"));
+    }
+    h
+}
+
+pub fn call(c: Conn, method: string, path: string, body: json.Json) -> Result<json.Json, string> {
+    let r = http.request_pairs(
+        method,
+        c.api + path,
+        json.stringify(body).to_bytes(),
+        headers(c),
+        40000
+    )?;
+    let j = json.parse(from_utf8(r.body).unwrap_or("{}")).unwrap_or(json.Json.JNull);
+    if (r.status >= 300) {
+        return Result.Err("${r.status}: ${json.get_string(j, "error").unwrap_or("?")}");
+    }
+    Result.Ok(j)
+}
+
+fn obj(pairs: [(string, json.Json)]) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    json.Json.JObject(m)
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+fn str(s: string) -> json.Json {
+    json.Json.JStr(s)
+}
+
+pub fn create_topic(
+    c: Conn,
+    topic: string,
+    partitions: int,
+    compact: bool
+) -> Result<json.Json, string> {
+    call(
+        c,
+        "PUT",
+        "/v1/topics/${url.url_encode(topic)}",
+        obj([("partitions", num(partitions)), ("compact", json.Json.JBool(compact))])
+    )
+}
+
+/// Sends (key, value) pairs; returns each record's (partition, offset).
+pub fn produce(c: Conn, topic: string, recs: [(string, string)]) -> Result<[(int, int)], string> {
+    let items = recs.map(fn(kv: (string, string)) -> json.Json {
+        let (k, v) = kv;
+        if (k == "") { obj([("value", str(v))]) } else { obj([("key", str(k)), ("value", str(v))]) }
+    });
+    let j = call(
+        c,
+        "POST",
+        "/v1/topics/${url.url_encode(topic)}/records",
+        obj([("records", json.Json.JArray(items))])
+    )?;
+    Result.Ok(json.get_array(j, "offsets").unwrap_or([]).map(fn(o: json.Json) -> (int, int) {
+        (json.get_int(o, "partition").unwrap_or(-1), json.get_int(o, "offset").unwrap_or(-1))
+    }))
+}
+
+/// Records of one partition from `offset`; returns them and the offset to ask next.
+pub fn fetch(
+    c: Conn,
+    topic: string,
+    p: int,
+    offset: string,
+    wait: string
+) -> Result<([Rec], int), string> {
+    let j = call(
+        c,
+        "GET",
+        "/v1/topics/${url.url_encode(topic)}/${p}?offset=${offset}&wait=${wait}",
+        json.Json.JNull
+    )?;
+    let recs = json.get_array(j, "records").unwrap_or([]).map(fn(r: json.Json) -> Rec {
+        Rec {
+            topic: topic,
+            partition: p,
+            offset: json.get_int(r, "offset").unwrap_or(-1),
+            key: json.get_string(r, "key").unwrap_or(""),
+            value: json.get_string(r, "value").unwrap_or("")
+        }
+    });
+    Result.Ok((recs, json.get_int(j, "next_offset").unwrap_or(0)))
+}
+
+/// What a consumer does with its records: a channel it hands them to (the consumer commits once
+/// `send` returns), and one that stops it when closed.
+pub struct Sink {
+    out: Channel<Rec>,
+    stop: Channel<int>,
+}
+
+fn stopped(s: Sink) -> bool {
+    match (try_recv(s.stop)) {
+        Received.Empty => false,
+        _ => true,
+    }
+}
+
+/// Consumes `topics` as `member` of `group` until `sink.stop` is closed; then leaves the group.
+pub fn consume(
+    c: Conn,
+    group: string,
+    member: string,
+    topics: [string],
+    sink: Sink
+) -> Result<int, string> {
+    let g = url.url_encode(group);
+    var delivered = 0;
+    while (!stopped(sink)) {
+        let joined = call(
+            c,
+            "POST",
+            "/v1/groups/${g}/join",
+            obj([("member", str(member)), ("topics", json.Json.JArray(topics.map(str)))])
+        )?;
+        let generation = json.get_int(joined, "generation").unwrap_or(0);
+        // Where each owned partition is: its committed offset, or the beginning.
+        var owned: [(string, int, int)] = [];
+        for a in json.get_array(joined, "assignment").unwrap_or([]) {
+            let committed = json.get_int(a, "committed").unwrap_or(-1);
+            owned.push(
+                (
+                    json.get_string(a, "topic").unwrap_or(""),
+                    json.get_int(a, "partition").unwrap_or(0),
+                    committed
+                )
+            );
+        }
+        var beat_at = time.now() + 1000;
+        var in_generation = true;
+        while (in_generation && !stopped(sink)) {
+            var progressed = false;
+            var commits: [json.Json] = [];
+            for i in 0..owned.len() {
+                let (t, p, at) = owned[i];
+                let from = if (at < 0) { "earliest" } else { to_string(at) };
+                match (fetch(c, t, p, from, "0s")) {
+                    Result.Ok((recs, next)) => {
+                        for r in recs {
+                            send(sink.out, r);
+                            delivered = delivered + 1;
+                        }
+                        if (recs.len() > 0 || (at < 0 && next >= 0)) {
+                            owned[i] = (t, p, next);
+                            if (recs.len() > 0) {
+                                progressed = true;
+                                commits.push(
+                                    obj(
+                                        [
+                                            ("topic", str(t)),
+                                            ("partition", num(p)),
+                                            ("offset", num(next))
+                                        ]
+                                    )
+                                );
+                            }
+                        }
+                    },
+                    Result.Err(e) => return Result.Err(e),
+                }
+            }
+            if (commits.len() > 0) {
+                match (call(
+                    c,
+                    "POST",
+                    "/v1/groups/${g}/commit",
+                    obj(
+                        [
+                            ("member", str(member)),
+                            ("generation", num(generation)),
+                            ("offsets", json.Json.JArray(commits))
+                        ]
+                    )
+                )) {
+                    Result.Ok(_) => { },
+                    // Stale: the partitions were dealt out again. What was handed on is redelivered.
+                    Result.Err(_) => in_generation = false,
+                }
+            }
+            if (time.now() >= beat_at) {
+                match (call(
+                    c,
+                    "POST",
+                    "/v1/groups/${g}/heartbeat",
+                    obj([("member", str(member)), ("generation", num(generation))])
+                )) {
+                    Result.Ok(j) => if (json.get_string(j, "status").unwrap_or("") != "ok") {
+                        in_generation = false;
+                    },
+                    Result.Err(_) => in_generation = false,
+                }
+                beat_at = time.now() + 1000;
+            }
+            if (!progressed && in_generation) {
+                // Nothing new anywhere: wait a little on the first partition before the next round.
+                if (owned.len() > 0) {
+                    let (t, p, at) = owned[0];
+                    fetch(c, t, p, if (at < 0) { "earliest" } else { to_string(at) }, "200ms");
+                } else {
+                    time.sleep(200);
+                }
+            }
+        }
+    }
+    call(c, "POST", "/v1/groups/${g}/leave", obj([("member", str(member))]));
+    Result.Ok(delivered)
+}

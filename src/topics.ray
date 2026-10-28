@@ -1,0 +1,198 @@
+//! The topics: their configuration in `<data>/topics.json` (replaced atomically), and a fiber per
+//! partition. One fiber owns the table; handlers ask it for a topic's partitions.
+
+import std/fs;
+import std/json;
+import partition;
+
+pub struct Topic {
+    name: string,
+    partitions: int,
+    policy: partition.Policy,
+}
+
+pub struct View {
+    topic: Topic,
+    parts: [Channel<partition.Msg>],
+}
+
+pub enum Msg {
+    Create(Topic, Channel<Result<bool, string>>),
+    Get(string, Channel<Option<View>>),
+    All(Channel<[View]>),
+    Stop(Channel<int>),
+}
+
+/// A topic name: 1–100 of `a-z A-Z 0-9 . _ -`.
+pub fn valid_name(s: string) -> bool {
+    if (s.len() < 1 || s.len() > 100 || s == "." || s == "..") {
+        return false;
+    }
+    for c in s.chars() {
+        if (!((c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '.'
+            || c == '_'
+            || c == '-')) {
+            return false;
+        }
+    }
+    true
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+fn topic_json(t: Topic) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("partitions", num(t.partitions));
+    m.insert("segment_bytes", num(t.policy.segment_bytes));
+    m.insert("retention_ms", num(t.policy.retention_ms));
+    m.insert("retention_bytes", num(t.policy.retention_bytes));
+    m.insert("compact", json.Json.JBool(t.policy.compact));
+    m.insert("tombstone_ms", num(t.policy.tombstone_ms));
+    json.Json.JObject(m)
+}
+
+fn topic_of(name: string, j: json.Json) -> Topic {
+    Topic {
+        name: name,
+        partitions: json.get_int(j, "partitions").unwrap_or(1),
+        policy: partition.Policy {
+            segment_bytes: json.get_int(j, "segment_bytes").unwrap_or(64 * 1024 * 1024),
+            retention_ms: json.get_int(j, "retention_ms").unwrap_or(0),
+            retention_bytes: json.get_int(j, "retention_bytes").unwrap_or(0),
+            compact: json.get_bool(j, "compact").unwrap_or(false),
+            tombstone_ms: json.get_int(j, "tombstone_ms").unwrap_or(86400000)
+        }
+    }
+}
+
+struct T {
+    data: string,
+    topics: Map<string, View>,
+}
+
+fn save(t: T) -> Result<int, string> {
+    let m: Map<string, json.Json> = Map.new();
+    for k in t.topics.keys() {
+        m.insert(k, topic_json(t.topics.get(k).unwrap().topic));
+    }
+    let path = "${t.data}/topics.json";
+    let h = fs.open(path + ".tmp", "w")?;
+    let w = fs.write(h, json.stringify_pretty(json.Json.JObject(m), 2));
+    let s = fs.sync(h);
+    close(h);
+    w?;
+    s?;
+    fs.rename(path + ".tmp", path)
+}
+
+fn open_topic(data: string, t: Topic) -> Result<(View, [string]), string> {
+    var parts: [Channel<partition.Msg>] = [];
+    var reports: [string] = [];
+    for p in 0..t.partitions {
+        let (ch, report) = partition.start("${data}/topics/${t.name}/${p}", t.policy)?;
+        parts.push(ch);
+        if (report != "") {
+            reports.push(report);
+        }
+    }
+    Result.Ok((View { topic: t, parts: parts }, reports))
+}
+
+/// Opens every topic under `data` (recovering each partition) and starts the table's fiber.
+/// Returns what recovery had to cut, for the log.
+pub fn start(data: string) -> Result<(Channel<Msg>, [string]), string> {
+    fs.mkdir("${data}/topics")?;
+    let path = "${data}/topics.json";
+    let table: Map<string, View> = Map.new();
+    var reports: [string] = [];
+    if (fs.exists(path)) {
+        let j = json.parse(fs.read_file(path)?)
+            .map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+        for (name, cfg) in json.as_object(j).unwrap_or(Map.new()) {
+            let (v, r) = open_topic(data, topic_of(name, cfg))?;
+            table.insert(name, v);
+            reports = reports + r;
+        }
+    }
+    let inbox: Channel<Msg> = Channel.bounded(1024);
+    spawn(fn() {
+        let t = T { data: data, topics: table };
+        while (true) {
+            match (recv(inbox)) {
+                Option.Some(Msg.Create(topic, reply)) => {
+                    let r = create(t, topic);
+                    send(reply, r);
+                },
+                Option.Some(Msg.Get(name, reply)) => send(reply, t.topics.get(name)),
+                Option.Some(Msg.All(reply)) => send(
+                    reply,
+                    sort(t.topics.keys()).map(fn(k: string) -> View { t.topics.get(k).unwrap() })
+                ),
+                Option.Some(Msg.Stop(reply)) => {
+                    for k in t.topics.keys() {
+                        for p in t.topics.get(k).unwrap().parts {
+                            partition.stop(p);
+                        }
+                    }
+                    send(reply, 0);
+                    return;
+                },
+                Option.None => return,
+            }
+        }
+    });
+    Result.Ok((inbox, reports))
+}
+
+// true = created; false = it existed with the same partitions (idempotent).
+fn create(t: T, topic: Topic) -> Result<bool, string> {
+    match (t.topics.get(topic.name)) {
+        Option.Some(v) => if (v.topic.partitions == topic.partitions) {
+            return Result.Ok(false);
+        } else {
+            return Result.Err("topic ${topic.name} exists with ${v.topic.partitions} partitions");
+        },
+        Option.None => { },
+    }
+    let (v, _) = open_topic(t.data, topic)?;
+    t.topics.insert(topic.name, v);
+    match (save(t)) {
+        Result.Ok(_) => Result.Ok(true),
+        Result.Err(e) => {
+            t.topics.remove(topic.name);
+            Result.Err(e)
+        },
+    }
+}
+
+pub fn create_topic(tb: Channel<Msg>, t: Topic) -> Result<bool, string> {
+    let r: Channel<Result<bool, string>> = Channel.bounded(1);
+    send(tb, Msg.Create(t, r));
+    recv(r).unwrap_or(Result.Err("topics stopped"))
+}
+
+pub fn lookup(tb: Channel<Msg>, name: string) -> Option<View> {
+    let r: Channel<Option<View>> = Channel.bounded(1);
+    send(tb, Msg.Get(name, r));
+    match (recv(r)) {
+        Option.Some(v) => v,
+        Option.None => Option.None,
+    }
+}
+
+pub fn all(tb: Channel<Msg>) -> [View] {
+    let r: Channel<[View]> = Channel.bounded(1);
+    send(tb, Msg.All(r));
+    recv(r).unwrap_or([])
+}
+
+pub fn stop(tb: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(tb, Msg.Stop(r));
+    recv(r);
+}

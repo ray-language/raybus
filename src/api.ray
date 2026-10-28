@@ -1,0 +1,429 @@
+//! The API, JSON over HTTP.
+//!
+//! ```
+//! PUT  /v1/topics/T        {partitions, retention?, retention_bytes?, segment_bytes?, compact?}
+//! GET  /v1/topics          every topic, with each partition's earliest and next offset
+//! POST /v1/topics/T/records   {records: [{key?, value | value_b64, partition?}]}  → their offsets
+//! GET  /v1/topics/T/P?offset=N|earliest|latest&max_bytes=1048576&wait=10s
+//! POST /v1/groups/G/join      {member, topics}       → {generation, assignment}
+//! POST /v1/groups/G/heartbeat {member, generation}   → {status: ok | rebalance}
+//! POST /v1/groups/G/commit    {member, generation, offsets: [{topic, partition, offset}]}
+//! POST /v1/groups/G/leave     {member}
+//! GET  /v1/groups/G
+//! ```
+//!
+//! A record's key picks its partition (FNV-1a of the key); records without one go round the
+//! partitions. A produce answers once every record is synced. Values are text, or `value_b64`.
+
+import std/base64;
+import std/json;
+import std/time;
+import net/webserver;
+import codec;
+import config;
+import groups;
+import partition;
+import topics;
+
+pub struct Ctx {
+    cfg: config.Config,
+    tb: Channel<topics.Msg>,
+    gc: Channel<groups.Msg>,
+}
+
+const MAX_WAIT_MS: int = 30000;
+
+fn reply(status: int, j: json.Json) -> webserver.Response {
+    let r = webserver.bytes_response(status, json.stringify(j).to_bytes());
+    r.headers.insert("Content-Type", "application/json");
+    r
+}
+
+pub fn obj(pairs: [(string, json.Json)]) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    json.Json.JObject(m)
+}
+
+fn error(status: int, message: string) -> webserver.Response {
+    reply(status, obj([("error", json.Json.JStr(message))]))
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+fn str(s: string) -> json.Json {
+    json.Json.JStr(s)
+}
+
+fn body(req: webserver.Request) -> Result<json.Json, webserver.Response> {
+    let t = webserver.request_text(req).unwrap_or("");
+    json.parse(if (t.trim() == "") { "{}" } else { t })
+        .map_err(fn(e: string) -> webserver.Response { error(400, "bad JSON: ${e}") })
+}
+
+pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    if (ctx.cfg.token != ""
+        && req.headers.get_or("authorization", "") != "Bearer ${ctx.cfg.token}") {
+        return error(401, "a bearer token is required");
+    }
+    let parts = req.path.split("/").filter(fn(p: string) -> bool { p != "" });
+    if (parts.len() < 2 || parts[0] != "v1") {
+        return error(404, "no such endpoint");
+    }
+    let n = parts.len();
+    match ((req.method, parts[1], n)) {
+        ("GET", "topics", 2) => list_topics(ctx),
+        ("PUT", "topics", 3) => create_topic(ctx, req, parts[2]),
+        ("POST", "topics", 4) => if (parts[3] == "records") {
+            produce(ctx, req, parts[2])
+        } else {
+            error(404, "no such endpoint")
+        },
+        ("GET", "topics", 4) => fetch(ctx, req, parts[2], parts[3]),
+        ("POST", "groups", 4) => group_op(ctx, req, parts[2], parts[3]),
+        ("GET", "groups", 3) => describe(ctx, parts[2]),
+        _ => error(404, "no such endpoint"),
+    }
+}
+
+fn create_topic(ctx: Ctx, req: webserver.Request, name: string) -> webserver.Response {
+    if (!topics.valid_name(name)) {
+        return error(400, "a topic name is 1-100 of A-Z a-z 0-9 . _ -");
+    }
+    let j = match (body(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let partitions = json.get_int(j, "partitions").unwrap_or(1);
+    if (partitions < 1 || partitions > 1024) {
+        return error(400, "partitions must be 1-1024");
+    }
+    let retention = match (json.get_string(j, "retention")) {
+        Option.Some(s) => match (config.duration_ms(s)) {
+            Option.Some(ms) => ms,
+            Option.None => return error(400, "bad retention '${s}'"),
+        },
+        Option.None => ctx.cfg.retention_ms,
+    };
+    let t = topics.Topic {
+        name: name,
+        partitions: partitions,
+        policy: partition.Policy {
+            segment_bytes: json.get_int(j, "segment_bytes").unwrap_or(ctx.cfg.segment_bytes),
+            retention_ms: retention,
+            retention_bytes: json.get_int(j, "retention_bytes").unwrap_or(0),
+            compact: json.get_bool(j, "compact").unwrap_or(false),
+            tombstone_ms: 86400000
+        }
+    };
+    match (topics.create_topic(ctx.tb, t)) {
+        Result.Ok(created) => reply(
+            if (created) { 201 } else { 200 },
+            obj(
+                [
+                    ("topic", str(name)),
+                    ("partitions", num(partitions)),
+                    ("created", json.Json.JBool(created))
+                ]
+            )
+        ),
+        Result.Err(e) => error(409, e),
+    }
+}
+
+fn list_topics(ctx: Ctx) -> webserver.Response {
+    var xs: [json.Json] = [];
+    for v in topics.all(ctx.tb) {
+        var ps: [json.Json] = [];
+        for i in 0..v.parts.len() {
+            let info = partition.info_of(v.parts[i]);
+            ps.push(
+                obj(
+                    [
+                        ("partition", num(i)),
+                        ("earliest", num(info.earliest)),
+                        ("next", num(info.next)),
+                        ("segments", num(info.segments)),
+                        ("bytes", num(info.size))
+                    ]
+                )
+            );
+        }
+        xs.push(
+            obj(
+                [
+                    ("topic", str(v.topic.name)),
+                    ("compact", json.Json.JBool(v.topic.policy.compact)),
+                    ("partitions", json.Json.JArray(ps))
+                ]
+            )
+        );
+    }
+    reply(200, obj([("topics", json.Json.JArray(xs))]))
+}
+
+fn produce(ctx: Ctx, req: webserver.Request, name: string) -> webserver.Response {
+    let v = match (topics.lookup(ctx.tb, name)) {
+        Option.Some(v) => v,
+        Option.None => return error(404, "no topic ${name}"),
+    };
+    let j = match (body(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let items = json.get_array(j, "records").unwrap_or([]);
+    if (items.len() == 0) {
+        return error(400, "records is required (a non-empty array)");
+    }
+    let n = v.parts.len();
+    // Each record to its partition, keeping the request's order within a partition.
+    var batches: [[codec.Record]] = [];
+    var where_: [(int, int)] = [];
+    for _ in 0..n {
+        batches.push([]);
+    }
+    var rr = (time.now() / 7) % n;
+    for it in items {
+        let key = json.get_string(it, "key").unwrap_or("").to_bytes();
+        let value = match (json.get_string(it, "value_b64")) {
+            Option.Some(b) => match (base64.base64_decode(b)) {
+                Result.Ok(x) => x,
+                Result.Err(_) => return error(400, "bad value_b64"),
+            },
+            Option.None => json.get_string(it, "value").unwrap_or("").to_bytes(),
+        };
+        let p = match (json.get_int(it, "partition")) {
+            Option.Some(p) => if (p >= 0 && p < n) { p } else {
+                return error(400, "no partition ${p}");
+            },
+            Option.None => if (key.len() > 0) {
+                codec.fnv1a(key) % n
+            } else {
+                rr = (rr + 1) % n;
+                rr
+            },
+        };
+        where_.push((p, batches[p].len()));
+        batches[p].push(
+            codec.Record {
+                offset: 0,
+                ts: json.get_int(it, "ts").unwrap_or(0),
+                key: key,
+                value: value
+            }
+        );
+    }
+    // The partitions append in parallel, each with its own commit.
+    let done: Channel<(int, Result<(int, int), string>)> = Channel.bounded(n);
+    var asked = 0;
+    for p in 0..n {
+        if (batches[p].len() > 0) {
+            let ch = v.parts[p];
+            let recs = batches[p];
+            spawn(fn() {
+                send(done, (p, partition.append(ch, recs)));
+            });
+            asked = asked + 1;
+        }
+    }
+    var first: [int] = [];
+    for _ in 0..n {
+        first.push(-1);
+    }
+    for _ in 0..asked {
+        match (recv(done)) {
+            Option.Some((p, Result.Ok((f, _)))) => first[p] = f,
+            Option.Some((_, Result.Err(e))) => return error(500, e),
+            Option.None => return error(500, "partition stopped"),
+        }
+    }
+    let out = where_.map(fn(w: (int, int)) -> json.Json {
+        let (p, i) = w;
+        obj([("partition", num(p)), ("offset", num(first[p] + i))])
+    });
+    reply(200, obj([("offsets", json.Json.JArray(out))]))
+}
+
+fn record_json(r: codec.Record) -> json.Json {
+    var pairs: [(string, json.Json)] = [("offset", num(r.offset)), ("ts", num(r.ts))];
+    if (r.key.len() > 0) {
+        pairs.push(("key", str(from_utf8(r.key).unwrap_or(base64.base64(r.key)))));
+    }
+    match (from_utf8(r.value)) {
+        Result.Ok(s) => pairs.push(("value", str(s))),
+        Result.Err(_) => pairs.push(("value_b64", str(base64.base64(r.value)))),
+    }
+    obj(pairs)
+}
+
+fn fetch(ctx: Ctx, req: webserver.Request, name: string, p_text: string) -> webserver.Response {
+    let v = match (topics.lookup(ctx.tb, name)) {
+        Option.Some(v) => v,
+        Option.None => return error(404, "no topic ${name}"),
+    };
+    let p = match (parse_int(p_text)) {
+        Option.Some(p) => if (p >= 0 && p < v.parts.len()) { p } else {
+            return error(404, "no partition ${p_text}");
+        },
+        Option.None => return error(404, "no partition ${p_text}"),
+    };
+    let ch = v.parts[p];
+    let q = webserver.query_params(req);
+    let info = partition.info_of(ch);
+    let offset = match (q.get_or("offset", "earliest")) {
+        "earliest" => info.earliest,
+        "latest" => info.next,
+        s => match (parse_int(s)) {
+            Option.Some(o) => o,
+            Option.None => return error(400, "offset is a number, earliest or latest"),
+        },
+    };
+    let max_bytes = parse_int(q.get_or("max_bytes", "1048576")).unwrap_or(1048576);
+    let wait = match (config.duration_ms(q.get_or("wait", "0s"))) {
+        Option.Some(ms) => if (ms > MAX_WAIT_MS) { MAX_WAIT_MS } else { ms },
+        Option.None => return error(400, "bad wait"),
+    };
+    var r = partition.read(ch, offset, if (max_bytes < 1024) { 1024 } else { max_bytes });
+    match (r) {
+        Result.Ok((recs, next)) => if (recs.len() == 0 && wait > 0 && offset >= next) {
+            partition.wait_past(ch, offset, wait);
+            r = partition.read(ch, offset, max_bytes);
+        },
+        Result.Err(_) => { },
+    }
+    match (r) {
+        Result.Ok((recs, next)) => {
+            let next_offset = if (recs.len() > 0) { recs[recs.len() - 1].offset + 1 } else {
+                if (offset > next) { next } else { offset }
+            };
+            reply(
+                200,
+                obj(
+                    [
+                        ("records", json.Json.JArray(recs.map(record_json))),
+                        ("next_offset", num(next_offset)),
+                        ("high_watermark", num(next))
+                    ]
+                )
+            )
+        },
+        Result.Err(e) => if (e.starts_with("out of range")) {
+            error(416, e)
+        } else {
+            error(500, e)
+        },
+    }
+}
+
+fn group_op(ctx: Ctx, req: webserver.Request, group: string, op: string) -> webserver.Response {
+    let j = match (body(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let member = json.get_string(j, "member").unwrap_or("");
+    let generation = json.get_int(j, "generation").unwrap_or(-1);
+    match (op) {
+        "join" => {
+            var names: [string] = [];
+            var counts: [(string, int)] = [];
+            for t in json.get_array(j, "topics").unwrap_or([]) {
+                let name = json.as_string(t).unwrap_or("");
+                match (topics.lookup(ctx.tb, name)) {
+                    Option.Some(v) => {
+                        names.push(name);
+                        counts.push((name, v.parts.len()));
+                    },
+                    Option.None => return error(404, "no topic ${name}"),
+                }
+            }
+            match (groups.join_group(ctx.gc, group, member, names, counts)) {
+                Result.Ok(jr) => {
+                    let a = jr.owned.map(fn(o: groups.Owned) -> json.Json {
+                        obj(
+                            [
+                                ("topic", str(o.topic)),
+                                ("partition", num(o.partition)),
+                                ("committed", num(o.committed))
+                            ]
+                        )
+                    });
+                    reply(
+                        200,
+                        obj(
+                            [
+                                ("generation", num(jr.generation)),
+                                ("assignment", json.Json.JArray(a))
+                            ]
+                        )
+                    )
+                },
+                Result.Err(e) => error(400, e),
+            }
+        },
+        "heartbeat" => match (groups.heartbeat_of(ctx.gc, group, member, generation)) {
+            Result.Ok(s) => reply(200, obj([("status", str(s))])),
+            Result.Err(e) => error(409, e),
+        },
+        "leave" => match (groups.leave_group(ctx.gc, group, member)) {
+            Result.Ok(g) => reply(200, obj([("generation", num(g))])),
+            Result.Err(e) => error(409, e),
+        },
+        "commit" => {
+            var offs: [(string, int, int)] = [];
+            for o in json.get_array(j, "offsets").unwrap_or([]) {
+                offs.push(
+                    (
+                        json.get_string(o, "topic").unwrap_or(""),
+                        json.get_int(o, "partition").unwrap_or(-1),
+                        json.get_int(o, "offset").unwrap_or(-1)
+                    )
+                );
+            }
+            match (groups.commit_offsets(ctx.gc, group, member, generation, offs)) {
+                Result.Ok(n) => reply(200, obj([("committed", num(n))])),
+                Result.Err(e) => error(409, e),
+            }
+        },
+        _ => error(404, "no such endpoint"),
+    }
+}
+
+fn describe(ctx: Ctx, group: string) -> webserver.Response {
+    match (groups.describe_group(ctx.gc, group)) {
+        Option.Some(v) => {
+            let members = v.members.map(fn(m: groups.MemberView) -> json.Json {
+                let owned = m.owned.map(fn(o: (string, int)) -> json.Json {
+                    let (t, p) = o;
+                    str("${t}/${p}")
+                });
+                obj(
+                    [
+                        ("member", str(m.id)),
+                        ("topics", json.Json.JArray(m.topics.map(str))),
+                        ("partitions", json.Json.JArray(owned)),
+                        ("idle_ms", num(m.idle_ms))
+                    ]
+                )
+            });
+            let committed = v.committed.map(fn(c: (string, int, int)) -> json.Json {
+                let (t, p, o) = c;
+                obj([("topic", str(t)), ("partition", num(p)), ("offset", num(o))])
+            });
+            reply(
+                200,
+                obj(
+                    [
+                        ("generation", num(v.generation)),
+                        ("members", json.Json.JArray(members)),
+                        ("committed", json.Json.JArray(committed))
+                    ]
+                )
+            )
+        },
+        Option.None => error(404, "no group ${group}"),
+    }
+}

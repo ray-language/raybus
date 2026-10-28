@@ -1,0 +1,88 @@
+//! `raybus.toml`: where to listen and keep the logs, and the defaults for new topics.
+//!
+//! ```toml
+//! [server]
+//! listen = "127.0.0.1:9500"
+//! data = "data"
+//! retention = "7d"          # default for new topics ("0s" = forever)
+//! segment_mb = 64           # a segment rolls at this size
+//! session = "10s"           # a group member that does not heartbeat for this long is out
+//! token = ""                # bearer token for every request ("" = open)
+//! ```
+
+import std/fs;
+import std/toml;
+
+pub struct Config {
+    host: string,
+    port: int,
+    data: string,
+    retention_ms: int,
+    segment_bytes: int,
+    session_ms: int,
+    token: string,
+}
+
+pub fn defaults() -> Config {
+    Config {
+        host: "127.0.0.1",
+        port: 9500,
+        data: "data",
+        retention_ms: 7 * 86400000,
+        segment_bytes: 64 * 1024 * 1024,
+        session_ms: 10000,
+        token: ""
+    }
+}
+
+/// `"500ms"`, `"15s"`, `"10m"`, `"6h"`, `"7d"` → milliseconds.
+pub fn duration_ms(s: string) -> Option<int> {
+    let (digits, unit) = if (s.ends_with("ms")) {
+        (s.substring(0, s.len() - 2), 1)
+    } else if (s.ends_with("s")) {
+        (s.substring(0, s.len() - 1), 1000)
+    } else if (s.ends_with("m")) {
+        (s.substring(0, s.len() - 1), 60000)
+    } else if (s.ends_with("h")) {
+        (s.substring(0, s.len() - 1), 3600000)
+    } else if (s.ends_with("d")) {
+        (s.substring(0, s.len() - 1), 86400000)
+    } else {
+        return Option.None;
+    };
+    let n = parse_int(digits)?;
+    if (n < 0 || n > 3650 * 86400) { Option.None } else { Option.Some(n * unit) }
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path)?)
+}
+
+fn str_of(e: [toml.TomlEntry], key: string, default: string) -> Result<string, string> {
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TStr(s)) => Result.Ok(s),
+        Option.Some(_) => Result.Err("${key} must be a string"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+pub fn parse(src: string) -> Result<Config, string> {
+    let e = toml.parse_toml(src)?;
+    var c = defaults();
+    let listen = str_of(e, "server.listen", "${c.host}:${c.port}")?;
+    let i = listen.last_index_of(":").ok_or("server.listen must be HOST:PORT")?;
+    c.host = listen.substring(0, i);
+    c.port = parse_int(listen.substring(i + 1, listen.len())).ok_or("server.listen: bad port")?;
+    c.data = str_of(e, "server.data", c.data)?;
+    let r = str_of(e, "server.retention", "7d")?;
+    c.retention_ms = duration_ms(r).ok_or("server.retention: '${r}' is not a duration")?;
+    let s = str_of(e, "server.session", "10s")?;
+    c.session_ms = duration_ms(s).ok_or("server.session: '${s}' is not a duration")?;
+    c.segment_bytes = match (toml.toml_get(e, "server.segment_mb")) {
+        Option.Some(toml.TomlValue.TInt(n)) => n * 1024 * 1024,
+        Option.Some(_) => return Result.Err("server.segment_mb must be an integer"),
+        Option.None => c.segment_bytes,
+    };
+    c.token = str_of(e, "server.token", "")?;
+    Result.Ok(c)
+}

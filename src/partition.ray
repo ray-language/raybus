@@ -1,0 +1,665 @@
+//! One partition: a log of records in segments `<dir>/<base offset, 20 digits>.log`, owned by one
+//! fiber. It appends with group commit (what queued during the last sync joins the next one),
+//! keeps a sparse in-memory index (offset → byte position), wakes the fetches waiting for new
+//! records, and applies retention and compaction to closed segments.
+//!
+//! Readers do not go through the fiber for the bytes: they ask where an offset is, and read
+//! the file themselves. A segment only ever grows, or is replaced whole by a rename.
+
+import std/fs;
+import std/time;
+import codec;
+
+pub struct Seg {
+    base: int,
+    path: string,
+    size: int,
+    /// (offset, byte position) every INDEX_EVERY records.
+    index: [(int, int)],
+    first: int,
+    last: int,
+    last_ts: int,
+}
+
+pub struct Loc {
+    path: string,
+    pos: int,
+    end: int,
+    next: int,
+    /// The first offset of the next segment that has records (or `next`): where to go when
+    /// this segment has nothing at or after the offset.
+    after: int,
+}
+
+pub struct Info {
+    earliest: int,
+    next: int,
+    segments: int,
+    size: int,
+}
+
+pub struct Policy {
+    segment_bytes: int,
+    retention_ms: int,
+    retention_bytes: int,
+    compact: bool,
+    tombstone_ms: int,
+}
+
+pub enum Msg {
+    Append([codec.Record], Channel<Result<(int, int), string>>),
+    Locate(int, Channel<Result<Loc, string>>),
+    /// Answer once the log reaches past this offset, or at the deadline (ms epoch).
+    Wait(int, int, Channel<int>),
+    Info(Channel<Info>),
+    Housekeep(Channel<int>),
+    Stop(Channel<int>),
+}
+
+const INDEX_EVERY: int = 32;
+
+const READ_CHUNK: int = 4 * 1024 * 1024;
+
+struct Waiter {
+    offset: int,
+    deadline: int,
+    reply: Channel<int>,
+}
+
+struct P {
+    dir: string,
+    segs: [Seg],
+    next: int,
+    out: int,
+    policy: Policy,
+    waiters: [Waiter],
+}
+
+fn name_of(base: int) -> string {
+    let s = to_string(base);
+    "0".repeat(20 - s.len()) + s + ".log"
+}
+
+// Reads a whole segment, chunk by chunk, into records plus the index. Returns the segment and
+// how many bytes at its end are not whole, valid records.
+fn load_segment(path: string, base: int) -> Result<(Seg, int, string), string> {
+    let h = fs.open(path, "r")?;
+    var seg = Seg {
+        base: base,
+        path: path,
+        size: 0,
+        index: [],
+        first: -1,
+        last: base - 1,
+        last_ts: 0
+    };
+    var carry = bytes_of([]);
+    var pos = 0;
+    var n = 0;
+    var stop = "";
+    while (stop == "") {
+        let chunk = match (fs.read_bytes(h, READ_CHUNK)) {
+            Result.Ok(Option.Some(c)) => c,
+            Result.Ok(Option.None) => break,
+            Result.Err(e) => {
+                close(h);
+                return Result.Err(e);
+            },
+        };
+        let buf = bytes_concat([carry, chunk]);
+        let d = codec.decode(buf, 0);
+        var at = pos;
+        var p = 0;
+        for r in d.records {
+            if (r.offset <= seg.last) {
+                stop = "offset ${r.offset} after ${seg.last} at byte ${at}";
+                break;
+            }
+            if (n % INDEX_EVERY == 0) {
+                seg.index.push((r.offset, at));
+            }
+            if (seg.first < 0) {
+                seg.first = r.offset;
+            }
+            seg.last = r.offset;
+            seg.last_ts = r.ts;
+            let len = codec.HEADER + 18 + r.key.len() + r.value.len();
+            at = at + len;
+            p = p + len;
+            n = n + 1;
+        }
+        if (stop == "") {
+            stop = d.stop;
+        }
+        pos = pos + p;
+        carry = buf.sub_bytes(p, buf.len());
+    }
+    close(h);
+    seg.size = pos;
+    let total = fs.file_size(path)?;
+    Result.Ok((seg, total - pos, stop))
+}
+
+// Keeps the first `keep` bytes of a file: copied to a temporary, synced, renamed over it.
+fn truncate(path: string, keep: int) -> Result<int, string> {
+    let tmp = path + ".tmp";
+    let src = fs.open(path, "r")?;
+    let dst = fs.open(tmp, "w")?;
+    var left = keep;
+    while (left > 0) {
+        match (fs.read_bytes(src, if (left < READ_CHUNK) { left } else { READ_CHUNK })?) {
+            Option.Some(b) => {
+                fs.write_bytes(dst, b)?;
+                left = left - b.len();
+            },
+            Option.None => break,
+        }
+    }
+    close(src);
+    fs.sync(dst)?;
+    close(dst);
+    fs.rename(tmp, path)
+}
+
+/// Opens (recovering) the partition in `dir` and starts its fiber. A partial or corrupt tail
+/// of the LAST segment (a crash mid-write) is cut off and reported; corruption anywhere else
+/// is an error.
+pub fn start(dir: string, policy: Policy) -> Result<(Channel<Msg>, string), string> {
+    fs.mkdir(dir)?;
+    var segs: [Seg] = [];
+    var report = "";
+    let names = fs.list_dir(dir)?.filter(fn(n: string) -> bool { n.ends_with(".log") });
+    for i in 0..names.len() {
+        let n = names[i];
+        let base = parse_int(n.strip_suffix(".log").unwrap_or("")).ok_or(
+            "${dir}/${n}: not a segment name"
+        )?;
+        let path = "${dir}/${n}";
+        let (seg, tail, stop) = load_segment(path, base)?;
+        if (tail > 0 || stop != "") {
+            if (i < names.len() - 1) {
+                return Result.Err(
+                    "${path}: ${if (stop != "") { stop } else { "trailing bytes" }} in a closed segment"
+                );
+            }
+            truncate(path, seg.size)?;
+            report = "${path}: cut ${tail} bytes after offset ${seg.last} (${if (stop != "") { stop } else { "a record cut short" }})";
+        }
+        segs.push(seg);
+    }
+    if (segs.len() == 0) {
+        segs.push(
+            Seg {
+                base: 0,
+                path: "${dir}/${name_of(0)}",
+                size: 0,
+                index: [],
+                first: -1,
+                last: -1,
+                last_ts: 0
+            }
+        );
+    }
+    let active = segs[segs.len() - 1];
+    let next = active.last + 1;
+    let out = fs.open(active.path, "a")?;
+    let inbox: Channel<Msg> = Channel.bounded(4096);
+    spawn(fn() {
+        let p = P { dir: dir, segs: segs, next: next, out: out, policy: policy, waiters: [] };
+        serve(p, inbox);
+    });
+    Result.Ok((inbox, report))
+}
+
+struct Pending {
+    recs: [codec.Record],
+    reply: Channel<Result<(int, int), string>>,
+}
+
+const MAX_BATCH: int = 50000;
+
+fn serve(p: P, inbox: Channel<Msg>) {
+    var housekeep_at = time.now() + 30000;
+    while (true) {
+        var pending: [Pending] = [];
+        match (select_timeout([inbox], 100)) {
+            Option.Some(_) => match (recv(inbox)) {
+                Option.Some(m) => if (!take(p, m, pending)) {
+                    return;
+                },
+                Option.None => return,
+            },
+            Option.None => { },
+        }
+        // Everything already queued joins this commit.
+        var count = 0;
+        for x in pending {
+            count = count + x.recs.len();
+        }
+        var more = pending.len() > 0;
+        while (more && count < MAX_BATCH) {
+            match (try_recv(inbox)) {
+                Received.Got(m) => {
+                    let before = pending.len();
+                    if (!take(p, m, pending)) {
+                        commit(p, pending);
+                        return;
+                    }
+                    if (pending.len() > before) {
+                        count = count + pending[pending.len() - 1].recs.len();
+                    }
+                },
+                _ => more = false,
+            }
+        }
+        commit(p, pending);
+        expire_waiters(p, time.now());
+        if (time.now() >= housekeep_at) {
+            housekeep(p, time.now());
+            housekeep_at = time.now() + 30000;
+        }
+    }
+}
+
+// false = stop.
+fn take(p: P, m: Msg, pending: [Pending]) -> bool {
+    match (m) {
+        Msg.Append(recs, reply) => pending.push(Pending { recs: recs, reply: reply }),
+        Msg.Locate(offset, reply) => send(reply, locate(p, offset)),
+        Msg.Wait(offset, deadline, reply) => if (p.next > offset || deadline <= time.now()) {
+            send(reply, p.next);
+        } else {
+            p.waiters.push(Waiter { offset: offset, deadline: deadline, reply: reply });
+        },
+        Msg.Info(reply) => send(reply, info(p)),
+        Msg.Housekeep(reply) => {
+            housekeep(p, time.now());
+            send(reply, 0);
+        },
+        Msg.Stop(reply) => {
+            close(p.out);
+            send(reply, 0);
+            return false;
+        },
+    }
+    true
+}
+
+fn info(p: P) -> Info {
+    var size = 0;
+    for s in p.segs {
+        size = size + s.size;
+    }
+    Info { earliest: earliest(p), next: p.next, segments: p.segs.len(), size: size }
+}
+
+fn earliest(p: P) -> int {
+    for s in p.segs {
+        if (s.first >= 0) {
+            return s.first;
+        }
+    }
+    p.next
+}
+
+fn commit(p: P, pending: [Pending]) {
+    if (pending.len() == 0) {
+        return;
+    }
+    let first = p.next;
+    var parts: [bytes] = [];
+    var spans: [(int, int)] = [];
+    let active = p.segs[p.segs.len() - 1];
+    var pos = active.size;
+    var n = 0;
+    let now = time.now();
+    for x in pending {
+        spans.push((p.next + n, x.recs.len()));
+        for r in x.recs {
+            let off = p.next + n;
+            let rec = codec.Record {
+                offset: off,
+                ts: if (r.ts > 0) { r.ts } else { now },
+                key: r.key,
+                value: r.value
+            };
+            let b = codec.encode(rec);
+            if ((active.last - active.base + 1 + n) % INDEX_EVERY == 0
+                || active.first < 0 && n == 0) {
+                active.index.push((off, pos));
+            }
+            parts.push(b);
+            pos = pos + b.len();
+            n = n + 1;
+        }
+    }
+    let r = write_synced(p.out, bytes_concat(parts));
+    match (r) {
+        Result.Ok(_) => {
+            if (active.first < 0 && n > 0) {
+                active.first = first;
+            }
+            active.size = pos;
+            active.last = first + n - 1;
+            active.last_ts = now;
+            p.next = first + n;
+            for i in 0..pending.len() {
+                let ok: Result<(int, int), string> = Result.Ok(spans[i]);
+                send(pending[i].reply, ok);
+            }
+            wake(p);
+            if (active.size >= p.policy.segment_bytes) {
+                roll(p);
+            }
+        },
+        Result.Err(e) => {
+            // The index entries pushed above point at bytes that were not written.
+            active.index = active.index.filter(fn(ix: (int, int)) -> bool {
+                let (o, _) = ix;
+                o < first
+            });
+            for x in pending {
+                let bad: Result<(int, int), string> = Result.Err(e);
+                send(x.reply, bad);
+            }
+        },
+    }
+}
+
+fn write_synced(h: int, b: bytes) -> Result<int, string> {
+    fs.write_bytes(h, b)?;
+    fs.sync_data(h)
+}
+
+fn roll(p: P) {
+    close(p.out);
+    let path = "${p.dir}/${name_of(p.next)}";
+    match (fs.open(path, "a")) {
+        Result.Ok(h) => {
+            p.out = h;
+            p.segs.push(
+                Seg {
+                    base: p.next,
+                    path: path,
+                    size: 0,
+                    index: [],
+                    first: -1,
+                    last: p.next - 1,
+                    last_ts: 0
+                }
+            );
+        },
+        Result.Err(e) => {
+            eprint("raybus: cannot roll ${p.dir}: ${e}; staying on the current segment");
+            p.out = fs.open(p.segs[p.segs.len() - 1].path, "a").unwrap_or(p.out);
+        },
+    }
+}
+
+fn wake(p: P) {
+    var keep: [Waiter] = [];
+    for w in p.waiters {
+        if (p.next > w.offset) {
+            send(w.reply, p.next);
+        } else {
+            keep.push(w);
+        }
+    }
+    p.waiters = keep;
+}
+
+fn expire_waiters(p: P, now: int) {
+    var keep: [Waiter] = [];
+    for w in p.waiters {
+        if (w.deadline <= now) {
+            send(w.reply, p.next);
+        } else {
+            keep.push(w);
+        }
+    }
+    p.waiters = keep;
+}
+
+/// Where to start reading `offset`: the segment that holds it and the indexed position at or
+/// before it (the reader skips the records before `offset`).
+fn locate(p: P, offset: int) -> Result<Loc, string> {
+    let first = earliest(p);
+    if (offset < first) {
+        return Result.Err("out of range: earliest is ${first}");
+    }
+    if (offset >= p.next) {
+        let a = p.segs[p.segs.len() - 1];
+        return Result.Ok(
+            Loc { path: a.path, pos: a.size, end: a.size, next: p.next, after: p.next }
+        );
+    }
+    var i = p.segs.len() - 1;
+    while (i > 0 && (p.segs[i].base > offset || p.segs[i].first < 0)) {
+        i = i - 1;
+    }
+    // Skip segments emptied by compaction, or that end before the offset.
+    while (i < p.segs.len() - 1 && p.segs[i].last < offset) {
+        i = i + 1;
+    }
+    let s = p.segs[i];
+    var pos = 0;
+    for (o, at) in s.index {
+        if (o > offset) {
+            break;
+        }
+        pos = at;
+    }
+    var after = p.next;
+    var j = i + 1;
+    while (j < p.segs.len()) {
+        if (p.segs[j].first >= 0) {
+            after = p.segs[j].first;
+            break;
+        }
+        j = j + 1;
+    }
+    Result.Ok(Loc { path: s.path, pos: pos, end: s.size, next: p.next, after: after })
+}
+
+// --- Retention and compaction (closed segments only) ---
+
+fn housekeep(p: P, now: int) {
+    retention(p, now);
+    if (p.policy.compact) {
+        match (compact(p, now)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => eprint("raybus: compaction of ${p.dir}: ${e}"),
+        }
+    }
+}
+
+fn retention(p: P, now: int) {
+    while (p.segs.len() > 1) {
+        let s = p.segs[0];
+        var total = 0;
+        for x in p.segs {
+            total = total + x.size;
+        }
+        let too_old = p.policy.retention_ms > 0
+            && s.last_ts > 0
+            && s.last_ts < now - p.policy.retention_ms;
+        let too_big = p.policy.retention_bytes > 0 && total > p.policy.retention_bytes;
+        let empty = s.first < 0;
+        if (!(too_old || too_big || empty)) {
+            return;
+        }
+        fs.remove_file(s.path);
+        p.segs = p.segs.slice(1, p.segs.len());
+    }
+}
+
+fn read_all(path: string) -> Result<[codec.Record], string> {
+    let b = fs.read_file_bytes(path)?;
+    let d = codec.decode(b, 0);
+    if (d.stop != "") {
+        return Result.Err("${path}: ${d.stop}");
+    }
+    Result.Ok(d.records)
+}
+
+/// Keeps, in the closed segments, only the last record of each key (records without a key
+/// stay); a tombstone (empty value) goes too once it is older than `tombstone_ms`. Offsets do
+/// not change: the log just gets gaps.
+pub fn compact(p: P, now: int) -> Result<int, string> {
+    if (p.segs.len() < 2) {
+        return Result.Ok(0);
+    }
+    // The newest offset of every key, over the whole log (the active segment included).
+    let latest: Map<string, int> = Map.new();
+    var all: [[codec.Record]] = [];
+    for s in p.segs {
+        let recs = read_all(s.path)?;
+        for r in recs {
+            if (r.key.len() > 0) {
+                latest.insert(from_utf8(r.key).unwrap_or(""), r.offset);
+            }
+        }
+        all.push(recs);
+    }
+    var dropped = 0;
+    for i in 0..p.segs.len() - 1 {
+        let s = p.segs[i];
+        var keep: [bytes] = [];
+        var index: [(int, int)] = [];
+        var pos = 0;
+        var first = -1;
+        var last = s.base - 1;
+        var last_ts = 0;
+        var n = 0;
+        for r in all[i] {
+            let k = from_utf8(r.key).unwrap_or("");
+            let newest = r.key.len() == 0 || latest.get_or(k, -1) == r.offset;
+            let dead_tombstone = r.value.len() == 0
+                && r.key.len() > 0
+                && r.ts < now - p.policy.tombstone_ms;
+            if (newest && !dead_tombstone) {
+                let b = codec.encode(r);
+                if (n % INDEX_EVERY == 0) {
+                    index.push((r.offset, pos));
+                }
+                if (first < 0) {
+                    first = r.offset;
+                }
+                last = r.offset;
+                last_ts = r.ts;
+                keep.push(b);
+                pos = pos + b.len();
+                n = n + 1;
+            } else {
+                dropped = dropped + 1;
+            }
+        }
+        if (n == all[i].len()) {
+            continue;
+        }
+        let tmp = s.path + ".tmp";
+        let h = fs.open(tmp, "w")?;
+        let w = fs.write_bytes(h, bytes_concat(keep));
+        let synced = fs.sync(h);
+        close(h);
+        w?;
+        synced?;
+        fs.rename(tmp, s.path)?;
+        p.segs[i] = Seg {
+            base: s.base,
+            path: s.path,
+            size: pos,
+            index: index,
+            first: first,
+            last: if (last < s.base) { s.last } else { last },
+            last_ts: if (last_ts > 0) { last_ts } else { s.last_ts }
+        };
+    }
+    Result.Ok(dropped)
+}
+
+// --- The client side ---
+
+pub fn append(p: Channel<Msg>, recs: [codec.Record]) -> Result<(int, int), string> {
+    let r: Channel<Result<(int, int), string>> = Channel.bounded(1);
+    send(p, Msg.Append(recs, r));
+    recv(r).unwrap_or(Result.Err("partition stopped"))
+}
+
+pub fn locate_at(p: Channel<Msg>, offset: int) -> Result<Loc, string> {
+    let r: Channel<Result<Loc, string>> = Channel.bounded(1);
+    send(p, Msg.Locate(offset, r));
+    recv(r).unwrap_or(Result.Err("partition stopped"))
+}
+
+/// The log's next offset, once it is past `offset` or `wait_ms` pass.
+pub fn wait_past(p: Channel<Msg>, offset: int, wait_ms: int) -> int {
+    let r: Channel<int> = Channel.bounded(1);
+    send(p, Msg.Wait(offset, time.now() + wait_ms, r));
+    recv(r).unwrap_or(0)
+}
+
+pub fn info_of(p: Channel<Msg>) -> Info {
+    let r: Channel<Info> = Channel.bounded(1);
+    send(p, Msg.Info(r));
+    recv(r).unwrap_or(Info { earliest: 0, next: 0, segments: 0, size: 0 })
+}
+
+pub fn housekeep_now(p: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(p, Msg.Housekeep(r));
+    recv(r);
+}
+
+pub fn stop(p: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(p, Msg.Stop(r));
+    recv(r);
+}
+
+/// Reads up to `max_bytes` of records from `offset` on, in the segment that holds it. Runs in the
+/// caller's fiber. Fewer records (even none) than asked is normal: ask again from the next offset.
+pub fn read(p: Channel<Msg>, offset: int, max_bytes: int) -> Result<([codec.Record], int), string> {
+    let loc = locate_at(p, offset)?;
+    if (offset >= loc.next) {
+        return Result.Ok(([], loc.next));
+    }
+    let h = fs.open(loc.path, "r")?;
+    fs.seek(h, loc.pos)?;
+    let want = if (loc.end - loc.pos < max_bytes) { loc.end - loc.pos } else { max_bytes };
+    var buf = bytes_of([]);
+    var parts: [bytes] = [];
+    var got = 0;
+    while (got < want) {
+        match (fs.read_bytes(h, want - got)?) {
+            Option.Some(b) => {
+                parts.push(b);
+                got = got + b.len();
+            },
+            Option.None => break,
+        }
+    }
+    close(h);
+    buf = bytes_concat(parts);
+    let d = codec.decode(buf, 0);
+    var out: [codec.Record] = [];
+    for r in d.records {
+        if (r.offset >= offset) {
+            out.push(r);
+        }
+    }
+    // A whole record bigger than max_bytes: read it anyway, alone.
+    if (out.len() == 0
+        && d.records.len() == 0
+        && d.stop == ""
+        && want == max_bytes
+        && max_bytes < codec.MAX_RECORD + codec.HEADER) {
+        return read(p, offset, codec.MAX_RECORD + codec.HEADER);
+    }
+    // Nothing at or after the offset here (compaction left a gap): go on where the next segment
+    // starts.
+    if (out.len() == 0 && d.stop == "" && loc.after > offset && loc.after < loc.next) {
+        return read(p, loc.after, max_bytes);
+    }
+    Result.Ok((out, loc.next))
+}
