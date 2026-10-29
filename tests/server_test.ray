@@ -60,9 +60,17 @@ fn member(
 fn bus_end_to_end() {
     let data = fs.make_temp_dir("raybus-e2e").unwrap();
     let (r, c) = boot(data);
-    assert(client.create_topic(c, "orders", 3, false).is_ok());
-    assert(client.create_topic(c, "orders", 3, false).is_ok());
-    assert(client.create_topic(c, "orders", 4, false).is_err());
+    assert_eq_msg(client.create_topic(c, "orders", 3, false).is_ok(), true, "create");
+    assert_eq_msg(
+        client.create_topic(c, "orders", 3, false).is_ok(),
+        true,
+        "create again, same partitions"
+    );
+    assert_eq_msg(
+        client.create_topic(c, "orders", 4, false).is_err(),
+        true,
+        "create again, other partitions"
+    );
 
     // The same key always lands on the same partition, in order.
     var batch: [(string, string)] = [];
@@ -77,7 +85,7 @@ fn bus_end_to_end() {
 
     // Fetch, and a long-poll woken by a produce.
     let (recs, next) = client.fetch(c, "orders", p0, "earliest", "0s").unwrap();
-    assert(recs.len() > 0 && next > 0);
+    assert_eq_msg((recs.len() > 0, next > 0), (true, true), "first fetch");
     assert_eq(recs[0].offset, 0);
     let (none, _) = client.fetch(c, "orders", 0, "latest", "0s").unwrap();
     assert_eq(none.len(), 0);
@@ -88,7 +96,7 @@ fn bus_end_to_end() {
     let t0 = time.now();
     let (woken, _) = client.fetch(c, "orders", p0, "latest", "5s").unwrap();
     assert_eq(woken[0].value, "late");
-    assert(time.now() - t0 < 3000);
+    assert_eq_msg(time.now() - t0 < 3000, true, "long-poll woken in time");
 
     // A group of two; one leaves halfway.
     let got: Channel<client.Rec> = Channel.bounded(10000);
@@ -115,15 +123,27 @@ fn bus_end_to_end() {
     let last: Map<int, int> = Map.new();
     for x in seen {
         let prev = last.get_or(x.partition, -1);
-        assert(x.offset <= prev + 1);
+        assert_eq_msg(
+            x.offset <= prev + 1,
+            true,
+            "partition ${x.partition}: offset ${x.offset} after ${prev}"
+        );
         last.insert(x.partition, x.offset);
     }
     let g = client.call(c, "GET", "/v1/groups/billing", json.Json.JNull).unwrap();
-    assert(json.get_int(g, "generation").unwrap() >= 3);
+    assert_eq_msg(
+        json.get_int(g, "generation").unwrap() >= 3,
+        true,
+        "generation after the rebalance"
+    );
 
     // A second raybus on the same directory is refused.
     let cfg2 = config.parse("[server]\nlisten = \"127.0.0.1:0\"\ndata = \"${data}\"\n").unwrap();
-    assert(server.start(cfg2, net.tcp_listen("127.0.0.1", 0).unwrap()).is_err());
+    assert_eq_msg(
+        server.start(cfg2, net.tcp_listen("127.0.0.1", 0).unwrap()).is_err(),
+        true,
+        "a second raybus on the same directory is refused"
+    );
     server.stop(r);
 
     // After a restart: the log is all there, and the group starts where it committed.
