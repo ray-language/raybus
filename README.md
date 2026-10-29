@@ -111,7 +111,9 @@ o del sistema (el `kill -9` de arriba), no de un corte de luz con la caché del 
 
 ## Hallazgos de dogfood
 
-En `../findings/open/raybus-1.27.85.md`:
+En `../findings/closed/2026-10/raybus-1.27.85.md`. Re-medido con 1.27.86: los dos arreglados; la campaña está archivada.
+
+Lo que se encontró con 1.27.85:
 
 - **#296 [D/E]**: un submódulo puede redefinir `join` (el módulo raíz no), y su función tapa al builtin
   en todo el archivo. Una `get` propia tapa el `m.get(k)` de `Map` por UFCS. Los errores no dicen qué
