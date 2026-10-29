@@ -119,15 +119,29 @@ fn bus_end_to_end() {
     recv(done_a);
     // At least once: every (partition, offset) produced was seen.
     assert_eq(unique.len(), 361);
-    // In order within a partition, per member stretch: a redelivery goes back, never skips ahead.
-    let last: Map<int, int> = Map.new();
-    for x in seen {
-        let prev = last.get_or(x.partition, -1);
-        assert_eq_msg(
-            x.offset <= prev + 1,
-            true,
-            "partition ${x.partition}: offset ${x.offset} after ${prev}"
+    // Across a rebalance the old and the new owner of a partition can both deliver for a moment
+    // (the old one's commit is refused): order holds per member and generation, not in the merged
+    // stream. So order is checked with a group of one, which never rebalances: every partition's
+    // offsets arrive contiguous, from 0.
+    let solo: Channel<client.Rec> = Channel.bounded(10000);
+    let stop_s: Channel<int> = Channel.bounded(1);
+    let done_s: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(
+            done_s,
+            client.consume(c, "audit", "only", ["orders"], client.Sink { out: solo, stop: stop_s })
         );
+    });
+    let alone: [client.Rec] = [];
+    let alone_unique: Map<string, bool> = Map.new();
+    gather(solo, alone, alone_unique, 361, 10000);
+    close(stop_s);
+    recv(done_s);
+    assert_eq_msg(alone.len(), 361, "a group of one gets each record exactly once");
+    let last: Map<int, int> = Map.new();
+    for x in alone {
+        let prev = last.get_or(x.partition, -1);
+        assert_eq_msg(x.offset, prev + 1, "partition ${x.partition}, alone: offset after ${prev}");
         last.insert(x.partition, x.offset);
     }
     let g = client.call(c, "GET", "/v1/groups/billing", json.Json.JNull).unwrap();

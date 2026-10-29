@@ -55,8 +55,12 @@ binario:
   estar en su partición y su offset, y los offsets de cada partición tienen que seguir sin huecos ni
   repeticiones. Tres rondas: 903 200 confirmados, 0 perdidos, 0 cambiados (unos cientos de más:
   escritos y sincronizados, pero muertos antes de contestar).
-- **La prueba de punta a punta**: dos consumidores de un grupo, uno se va a mitad. Cada registro llega
-  al menos una vez, y dentro de una partición nunca se salta hacia delante.
+- **La prueba de punta a punta**: dos consumidores de un grupo, uno se va a mitad, y cada registro llega
+  al menos una vez. El orden se comprueba con un grupo de un solo miembro, que no rebalancea: en cada
+  partición los offsets llegan seguidos desde 0. En un rebalanceo, el dueño antiguo y el nuevo pueden
+  entregar a la vez durante un momento (al antiguo se le rechaza el commit), así que en el flujo de
+  dos miembros mezclados no hay orden que comprobar. La primera versión del test lo comprobaba ahí y
+  falló en el CI de Linux.
 
 ## Cómo
 
